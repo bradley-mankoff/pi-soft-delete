@@ -4,7 +4,7 @@
   "description": "Soft delete for pi: before a shell command that would destroy work runs, keep a copy of what it destroys for a week, and never refuse the command.",
   "license": "MIT",
   "keywords": ["pi-package"],
-  "pi": { "extensions": ["./extensions"] },
+  "pi": { "extensions": ["./extensions/soft-delete.ts"] },
   "dependencies": { "cc-safety-net": "2.8.1" },
   "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
   "scripts": { "test": "node --experimental-strip-types --no-warnings --test tests/*.test.ts" }
