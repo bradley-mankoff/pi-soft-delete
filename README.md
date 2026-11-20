@@ -7,8 +7,10 @@ Before pi runs a bash command, the extension asks [cc-safety-net](https://github
 ## What it archives
 
 - **A git discard** — `git checkout`, `git restore`, `git reset --hard`, `git clean -f`, `git stash drop` or `clear`, `git switch` with discard — keeps every changed and untracked file `git status` lists in the repository the command names, including one named by `git -C` or an earlier `cd`.
-- **A recursive delete outside `/tmp` and `$TMPDIR`** keeps each named path that exists, including a `.git` folder, whose loss takes every unpushed commit and stash with it. `rm -rf /tmp/...` archives nothing. A target inside the archive root itself is not copied.
+- **A recursive delete outside `/tmp` and `$TMPDIR`** keeps each named path that exists, including a `.git` folder, whose loss takes every unpushed commit and stash with it. A relative target is resolved from the folder the tool call runs in, or from the folder an earlier literal `cd` names. `rm -rf /tmp/...` archives nothing. A target inside the archive root itself is not copied.
 - **A command whose targets cannot be worked out** — a variable, a glob, a pipe into `xargs` or `find`, or another command before `git` that hides which repository it uses — gets a note only, saying so.
+
+cc-safety-net reports only the first refusal in a command, so when a command chains several parts with `;`, `&&` or `||`, only the part that holds the refused command is archived. The note lists the later parts under "Not examined", so a destructive one among them is not lost silently.
 
 Rules that only read, including every `secret.*` rule, archive nothing because reading destroys nothing.
 

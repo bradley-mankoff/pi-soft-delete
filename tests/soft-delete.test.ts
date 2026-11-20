@@ -203,6 +203,38 @@ test("rm -rf .git archives the git metadata under the rule that protects it", as
 	}
 });
 
+test("a recursive delete behind a literal cd archives the folder the cd names", async () => {
+	const workspace = makeWorkspace();
+	const cwd = outsideTemporaryFolders("pi-soft-delete-cwd-");
+	const target = outsideTemporaryFolders("pi-soft-delete-target-");
+	try {
+		mkdirSync(join(cwd, "sub"));
+		writeFileSync(join(cwd, "sub", "kept.txt"), "the folder the tool call ran in\n");
+		mkdirSync(join(target, "sub"));
+		writeFileSync(join(target, "sub", "kept.txt"), "the folder the cd names\n");
+
+		const handlers = loadSoftDelete(workspace.settings);
+		const result = await driveToolCall(handlers, workspace, `cd ${target} && rm -rf sub`, cwd);
+
+		assert.equal(result, undefined);
+		const archive = onlyArchive(workspace);
+		assert.equal(
+			readFileSync(join(archive, "files", target.slice(1), "sub", "kept.txt"), "utf8"),
+			"the folder the cd names\n",
+		);
+		assert.ok(
+			noteOf(archive).includes(
+				`cp -R '${join(archive, "files", target.slice(1), "sub")}' '${join(target, "sub")}'`,
+			),
+			noteOf(archive),
+		);
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+		rmSync(target, { recursive: true, force: true });
+		clearWorkspace(workspace);
+	}
+});
+
 test("rm -rf of a folder outside the temporary folders archives the folder", async () => {
 	const workspace = makeWorkspace();
 	const cwd = outsideTemporaryFolders(".soft-delete-cwd-");
@@ -349,6 +381,25 @@ test("the keep-days setting decides how old an archive may be", async () => {
 		await driveSessionStart(handlers, workspace);
 
 		assert.equal(existsSync(join(kept, "note.md")), true);
+	} finally {
+		clearWorkspace(workspace);
+	}
+});
+
+test("a chained command notes the later parts it did not examine", async () => {
+	const workspace = makeWorkspace();
+	try {
+		commitFiles(workspace.repo, { "notes.txt": "committed\n" });
+		writeFileSync(join(workspace.repo, "notes.txt"), "uncommitted\n");
+		mkdirSync(join(workspace.repo, "sub"));
+		writeFileSync(join(workspace.repo, "sub", "kept.txt"), "the later part's contents\n");
+
+		const handlers = loadSoftDelete(workspace.settings);
+		const result = await driveToolCall(handlers, workspace, "git checkout -- . ; rm -rf sub");
+
+		assert.equal(result, undefined);
+		const note = noteOf(onlyArchive(workspace));
+		assert.match(note, /## Not examined[\s\S]*- `rm -rf sub`/);
 	} finally {
 		clearWorkspace(workspace);
 	}
