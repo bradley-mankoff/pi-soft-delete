@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "pi_soft_delete",
+  "project_id": "04df78d0-9000-41a5-a49b-138c703b2ec3"
+}
