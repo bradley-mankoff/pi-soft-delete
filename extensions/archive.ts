@@ -3,9 +3,10 @@
  * note saying what was destroyed and how to put it back.
  *
  * A command is only archived when cc-safety-net would refuse it under a rule this package
- * knows destroys work: the git commands that discard uncommitted changes or move a ref, and
- * recursive deletes. Nothing here decides whether the command runs; the caller lets it run
- * either way, and a failure to archive is reported in the note instead of thrown.
+ * knows destroys work: the git commands that discard uncommitted changes, remove a linked
+ * worktree or move a ref, and recursive deletes. Nothing here decides whether the command
+ * runs; the caller lets it run either way, and a failure to archive is reported in the note
+ * instead of thrown.
  */
 import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -53,7 +54,7 @@ export const settingsOf = (settings: unknown): SoftDeleteSettings => {
 };
 
 /** What kind of destruction a rule causes, when this package keeps a copy for it. */
-type Destruction = "git-discard" | "git-ref" | "recursive-delete";
+type Destruction = "git-discard" | "git-ref" | "git-worktree" | "recursive-delete";
 
 /**
  * The rule ids whose denial means work is about to be destroyed, and what kind, matched by the
@@ -94,6 +95,13 @@ const GIT_REF_RULES = new Set([
 	"git.tag-delete",
 ]);
 
+/**
+ * The rule ids whose denial means a linked worktree is about to be removed, taking the
+ * uncommitted and untracked files in it. A removal without `--force` is allowed, since git
+ * itself refuses one that would delete work.
+ */
+const GIT_WORKTREE_RULES = new Set(["git.worktree-remove-force"]);
+
 const RECURSIVE_DELETE_RULES = new Set([
 	"rm.git-metadata",
 	"rm.recursive-force-cwd-self",
@@ -126,6 +134,7 @@ const targetSupplier = (ruleId: string): "find" | "xargs" | "parallel" | undefin
 const destructionOf = (ruleId: string): Destruction | undefined => {
 	if (GIT_DISCARD_RULES.has(ruleId)) return "git-discard";
 	if (GIT_REF_RULES.has(ruleId)) return "git-ref";
+	if (GIT_WORKTREE_RULES.has(ruleId)) return "git-worktree";
 	if (RECURSIVE_DELETE_RULES.has(ruleId)) return "recursive-delete";
 	return undefined;
 };
@@ -193,6 +202,27 @@ const OPERATORS = ["&", "|", ";", ">", "<"];
 const STATEMENT_SEPARATORS = ["&", "|", ";"];
 
 /**
+ * The words a command names after its options, up to the operator that ends the statement. A
+ * `--` ends the options, so a path after it is read as written; git subcommands and rm share
+ * this reading because a path is an operand to either.
+ */
+const operandsAfter = (tokens: string[], start: number): string[] => {
+	const operands: string[] = [];
+	let optionsEnded = false;
+	for (let index = start; index < tokens.length; index += 1) {
+		const token = tokens[index];
+		if (OPERATORS.includes(token)) break;
+		if (!optionsEnded && token === "--") {
+			optionsEnded = true;
+			continue;
+		}
+		if (!optionsEnded && token.startsWith("-") && token !== "-") continue;
+		operands.push(token);
+	}
+	return operands;
+};
+
+/**
  * The folder a command runs in: the tool call's cwd, moved by each `cd <literal>` that opens
  * an earlier statement. Anything else before the command (a wrapper such as `sudo`, a
  * variable assignment, a folder this package cannot read) leaves the folder unknown, because
@@ -230,12 +260,19 @@ const GIT_OPTIONS_TAKING_A_VALUE = new Set(["-C", "-c", "--git-dir", "--work-tre
 const GIT_FOLDER_OPTIONS = new Set(["-C", "--git-dir", "--work-tree", "--exec-path"]);
 
 /**
- * The global options before a git subcommand (`-C <path>`, `--git-dir`, and the like), which
- * say which folder and repository git works in. A dynamic one is reported rather than passed
- * to git, because a path that cannot be read names no repository to copy from.
+ * The global options before a git subcommand (`-C <path>`, `--git-dir`, and the like), and the
+ * folder they leave git running in: `-C` moves that folder, each one resolved from the folder
+ * before it, so the caller starts the walk at the folder git would run in. A dynamic option is
+ * reported rather than passed to git, because a path that cannot be read names no repository
+ * to copy from.
  */
-const gitGlobalOptions = (tokens: string[], gitAt: number): { options: string[] } | { unknown: string } => {
+const gitGlobalOptions = (
+	tokens: string[],
+	gitAt: number,
+	startFolder: string,
+): { options: string[]; folder: string } | { unknown: string } => {
 	const options: string[] = [];
+	let folder = startFolder;
 	for (let index = gitAt + 1; index < tokens.length; index += 1) {
 		const token = tokens[index];
 		if (!token.startsWith("-") || token === "-" || OPERATORS.includes(token)) break;
@@ -245,19 +282,22 @@ const gitGlobalOptions = (tokens: string[], gitAt: number): { options: string[] 
 		const value = tokens[index + 1];
 		if (value === undefined) return { unknown: `the option \`${token}\` has no value` };
 		if (isDynamic(value)) return { unknown: `the value \`${value}\` of ${token} cannot be read` };
-		options.push(GIT_FOLDER_OPTIONS.has(token) ? expandTilde(value) : value);
+		const written = GIT_FOLDER_OPTIONS.has(token) ? expandTilde(value) : value;
+		options.push(written);
+		if (token === "-C") folder = resolve(folder, written);
 		index += 1;
 	}
-	return { options };
+	return { options, folder };
 };
 
 /** Where a git command runs and which repository it names, after its global options. */
-type GitPlacement = { repo: string; tokens: string[]; gitAt: number; options: string[] };
+type GitPlacement = { folder: string; repo: string; tokens: string[]; gitAt: number; options: string[] };
 
 /**
  * The repository a git command names, read from the tool call's folder and the absolute options
  * that choose another (`-C`, `--git-dir`, ...). Git and every subcommand share this reading, so
- * `cd <folder> && git ...` and `git -C <folder> ...` archive from the repository they name.
+ * `cd <folder> && git ...` and `git -C <folder> ...` archive from the repository they name. The
+ * folder is the one git runs in after `-C`, which is where a relative operand is resolved.
  */
 const gitPlacement = (command: string, cwd: string): GitPlacement | { unknown: string } => {
 	const tokens = tokenize(command);
@@ -265,19 +305,29 @@ const gitPlacement = (command: string, cwd: string): GitPlacement | { unknown: s
 	if (gitAt === -1) return { unknown: "the command does not name a git whose folder could be read" };
 	const placed = folderBefore(tokens, gitAt, cwd, "git");
 	if ("unknown" in placed) return placed;
-	const parsed = gitGlobalOptions(tokens, gitAt);
+	const parsed = gitGlobalOptions(tokens, gitAt, placed.folder);
 	if ("unknown" in parsed) return parsed;
 	const top = spawnSync("git", [...parsed.options, "rev-parse", "--show-toplevel"], { cwd: placed.folder, encoding: "utf8" });
 	if (top.status !== 0) return { unknown: "the folder is not a git repository" };
-	return { repo: top.stdout.trim(), tokens, gitAt, options: parsed.options };
+	return { folder: parsed.folder, repo: top.stdout.trim(), tokens, gitAt, options: parsed.options };
 };
 
-/** The repository a git command runs in, and every changed and untracked file git status lists in it. */
-const gitTargets = (command: string, cwd: string): { repo: string; targets: Target[] } | { unknown: string } => {
-	const placement = gitPlacement(command, cwd);
-	if ("unknown" in placement) return placement;
-	const status = spawnSync("git", [...placement.options, "status", "--porcelain=v1", "-z", "--untracked-files=all"], {
-		cwd: placement.repo,
+/** Run git in a repository, answering its output or the first line of what went wrong. */
+const runGit = (repo: string, args: string[]): { ok: true; stdout: string } | { ok: false; why: string } => {
+	const result = spawnSync("git", args, { cwd: repo, encoding: "utf8" });
+	if (result.status === 0) return { ok: true, stdout: result.stdout.trim() };
+	const why = (result.stderr || result.stdout || `git ${args.join(" ")} failed`).trim().split("\n")[0] ?? "git failed";
+	return { ok: false, why };
+};
+
+/**
+ * The changed and untracked files git status lists in one working tree, as targets stored under
+ * `files/` at the path git names. Porcelain paths are relative to the working tree root, so the
+ * folder passed must be that root.
+ */
+const statusTargets = (root: string, options: string[]): { targets: Target[] } | { unknown: string } => {
+	const status = spawnSync("git", [...options, "status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+		cwd: root,
 		encoding: "utf8",
 	});
 	if (status.status !== 0) return { unknown: "git status failed" };
@@ -289,17 +339,76 @@ const gitTargets = (command: string, cwd: string): { repo: string; targets: Targ
 		const state = entry.slice(0, 2);
 		const path = entry.slice(3);
 		if (state.includes("R") || state.includes("C")) index += 1;
-		targets.push({ label: path, source: join(placement.repo, path), stored: join("files", path) });
+		targets.push({ label: path, source: join(root, path), stored: join("files", path) });
 	}
-	return { repo: placement.repo, targets };
+	return { targets };
 };
 
-/** Run git in a repository, answering its output or the first line of what went wrong. */
-const runGit = (repo: string, args: string[]): { ok: true; stdout: string } | { ok: false; why: string } => {
-	const result = spawnSync("git", args, { cwd: repo, encoding: "utf8" });
-	if (result.status === 0) return { ok: true, stdout: result.stdout.trim() };
-	const why = (result.stderr || result.stdout || `git ${args.join(" ")} failed`).trim().split("\n")[0] ?? "git failed";
-	return { ok: false, why };
+/** How a removed worktree was checked out, so the note can recreate it before copying the files back. */
+type WorktreeCheckout = { branch?: string; head?: string };
+
+/**
+ * The working tree a command acts on, named for what the note calls it: the repository a discard
+ * or a ref move runs in, or the linked worktree a forced removal takes, which also needs its
+ * checkout to be recreated before the copies land back in it.
+ */
+type WorkingTree = { kind: "repository"; root: string } | { kind: "worktree"; root: string; checkout: WorktreeCheckout };
+
+/** Whether two paths name the same folder, following a symlink such as macOS's /tmp. */
+const sameFolder = (left: string, right: string): boolean => {
+	try {
+		return realpathSync(left) === realpathSync(right);
+	} catch {
+		return false;
+	}
+};
+
+/** The repository a git command runs in, and every changed and untracked file git status lists in it. */
+const gitTargets = (command: string, cwd: string): { tree: WorkingTree; targets: Target[] } | { unknown: string } => {
+	const placement = gitPlacement(command, cwd);
+	if ("unknown" in placement) return placement;
+	const listed = statusTargets(placement.repo, placement.options);
+	if ("unknown" in listed) return listed;
+	return { tree: { kind: "repository", root: placement.repo }, targets: listed.targets };
+};
+
+/**
+ * The linked worktree a `git worktree remove` names, with its changed and untracked files and
+ * its checkout. The path is resolved from the folder git runs in, so `git -C <repo> worktree
+ * remove ../wt` and `cd <repo> && git worktree remove <wt>` find the worktree they name. A
+ * path that is not the root of a working tree is named rather than guessed at, because git
+ * itself would refuse it and its status paths would not be relative to it.
+ */
+const worktreeTargets = (command: string, cwd: string): { tree: WorkingTree; targets: Target[] } | { unknown: string } => {
+	const placement = gitPlacement(command, cwd);
+	if ("unknown" in placement) return placement;
+	const subcommand = gitSubcommand(placement.tokens, placement.gitAt);
+	if (subcommand === undefined || subcommand.name !== "worktree") {
+		return { unknown: "the command does not name a git worktree command" };
+	}
+	const [operation, named] = operandsAfter(placement.tokens, subcommand.at + 1);
+	if (operation !== "remove") return { unknown: "the command is not a git worktree remove" };
+	if (named === undefined) return { unknown: "the command names no worktree" };
+	if (isDynamic(named)) return { unknown: `the worktree \`${named}\` is a variable or a glob` };
+	const root = resolve(placement.folder, expandTilde(named));
+	const top = runGit(root, ["rev-parse", "--show-toplevel"]);
+	if (!top.ok) return { unknown: "the worktree folder is not a git working tree" };
+	if (!sameFolder(top.stdout, root)) return { unknown: "the folder is not the root of a git working tree" };
+	const listed = statusTargets(root, []);
+	if ("unknown" in listed) return listed;
+	const branch = runGit(root, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+	const head = runGit(root, ["rev-parse", "--verify", "HEAD"]);
+	return {
+		tree: {
+			kind: "worktree",
+			root,
+			checkout: {
+				...(branch.ok && branch.stdout !== "" ? { branch: branch.stdout } : {}),
+				...(head.ok && head.stdout !== "" ? { head: head.stdout } : {}),
+			},
+		},
+		targets: listed.targets,
+	};
 };
 
 /** A ref inside a bundle: its old tip, the ref the bundle names, and the ref the restore puts it back as. */
@@ -693,17 +802,7 @@ const deleteTargets = (command: string, cwd: string): { paths: string[] } | { un
 	if (rmAt === -1) return { unknown: "the command does not name an rm whose targets could be read" };
 	const placed = folderBefore(tokens, rmAt, cwd, "rm");
 	if ("unknown" in placed) return placed;
-	const operands: string[] = [];
-	let optionsEnded = false;
-	for (const token of tokens.slice(rmAt + 1)) {
-		if (OPERATORS.includes(token)) break;
-		if (!optionsEnded && token === "--") {
-			optionsEnded = true;
-			continue;
-		}
-		if (!optionsEnded && token.startsWith("-") && token !== "-") continue;
-		operands.push(token);
-	}
+	const operands = operandsAfter(tokens, rmAt + 1);
 	if (operands.length === 0) return { unknown: "the command names no path" };
 	const paths: string[] = [];
 	for (const operand of operands) {
@@ -799,7 +898,7 @@ const openArchive = (settings: SoftDeleteSettings, ruleId: string, now: Date): s
 
 /** The command word whose statement cc-safety-net refused, so the parts after that statement can be named. */
 const refusedWord = (destruction: Destruction, ruleId: string): string =>
-	destruction === "git-discard" || destruction === "git-ref" ? "git" : (targetSupplier(ruleId) ?? "rm");
+	destruction.startsWith("git-") ? "git" : (targetSupplier(ruleId) ?? "rm");
 
 /**
  * The statements a command runs after the one that holds the refused command, as written.
@@ -824,11 +923,29 @@ const laterStatements = (tokens: string[], commandAt: number): string[] => {
 	return statements;
 };
 
-const restoreLines = (destruction: Destruction, archive: string, copied: Target[], repo: string | undefined): string[] => {
+/**
+ * The `git worktree add` command that recreates a removed worktree at the branch or commit it
+ * had, detached when it had no branch. A worktree whose HEAD names neither leaves a placeholder
+ * in the line, since the archive holds nothing that says what to check it out from.
+ */
+const worktreeAddLine = (worktree: string, checkout: WorktreeCheckout): string => {
+	if (checkout.branch !== undefined) return `    git worktree add '${worktree}' '${checkout.branch}'`;
+	if (checkout.head !== undefined) return `    git worktree add --detach '${worktree}' '${checkout.head}'`;
+	return `    git worktree add '${worktree}' '<branch-or-commit>'`;
+};
+
+const restoreLines = (archive: string, copied: Target[], tree: WorkingTree | undefined): string[] => {
 	if (copied.length === 0) return [];
-	if (destruction === "git-discard") {
-		if (repo === undefined) return [];
-		return ["Copy the archived files back over the repository:", "", `    cp -R '${archive}/files/.' '${repo}/'`];
+	if (tree?.kind === "worktree") {
+		return [
+			"In the repository the worktree belongs to, recreate it from the branch or commit it had, then copy the archived files back over it:",
+			"",
+			worktreeAddLine(tree.root, tree.checkout),
+			`    cp -R '${archive}/files/.' '${tree.root}/'`,
+		];
+	}
+	if (tree?.kind === "repository") {
+		return ["Copy the archived files back over the repository:", "", `    cp -R '${archive}/files/.' '${tree.root}/'`];
 	}
 	return copied.flatMap((target) => [`    cp -R '${join(archive, target.stored)}' '${target.label}'`]);
 };
@@ -859,12 +976,12 @@ const writeNote = (options: {
 	ruleId: string;
 	now: Date;
 	destruction: Destruction;
-	repo: string | undefined;
+	tree: WorkingTree | undefined;
 	unknown: string | undefined;
 	later: string[];
 	kept: Kept;
 }): void => {
-	const { archive, command, cwd, sessionFile, ruleId, now, destruction, repo, unknown, later, kept } = options;
+	const { archive, command, cwd, sessionFile, ruleId, now, destruction, tree, unknown, later, kept } = options;
 	const keptWord = kept.kind === "bundled" ? "bundled" : "copied";
 	const lines = [
 		"# Soft delete archive",
@@ -873,7 +990,7 @@ const writeNote = (options: {
 		`- Folder: ${cwd}`,
 		`- Session file: ${sessionFile ?? "(unknown)"}`,
 		`- Rule: ${ruleId}`,
-		...(repo !== undefined ? [`- Repository: ${repo}`] : []),
+		...(tree !== undefined ? [`- ${tree.kind === "worktree" ? "Worktree" : "Repository"}: ${tree.root}`] : []),
 		`- Created: ${now.toISOString()}`,
 		"",
 	];
@@ -890,7 +1007,9 @@ const writeNote = (options: {
 	}
 	lines.push("## Restore", "");
 	const restore =
-		kept.kind === "bundled" ? bundleRestoreLines(archive, kept.bundles) : restoreLines(destruction, archive, kept.copied, repo);
+		kept.kind === "bundled"
+			? bundleRestoreLines(archive, kept.bundles)
+			: restoreLines(archive, kept.copied, tree);
 	lines.push(...(restore.length > 0 ? restore : [`Nothing was ${keptWord}, so there is nothing to restore.`]));
 	if (kept.kind === "bundled") {
 		lines.push("", "## Bundled refs", "");
@@ -952,7 +1071,7 @@ export const archiveCommand = (options: {
 			ruleId: verdict.ruleId,
 			now,
 			destruction,
-			repo: listed.repo,
+			tree: listed.repo === undefined ? undefined : { kind: "repository", root: listed.repo },
 			unknown: listed.unknown,
 			later,
 			kept: { kind: "bundled", bundles: written.bundles, notBundled: [...listed.missing, ...written.notBundled] },
@@ -960,16 +1079,16 @@ export const archiveCommand = (options: {
 		return archive;
 	}
 
-	let repo: string | undefined;
+	let tree: WorkingTree | undefined;
 	let targets: Target[];
 	let unknown: string | undefined;
-	if (destruction === "git-discard") {
-		const listed = gitTargets(command, cwd);
+	if (destruction === "git-discard" || destruction === "git-worktree") {
+		const listed = destruction === "git-worktree" ? worktreeTargets(command, cwd) : gitTargets(command, cwd);
 		if ("unknown" in listed) {
 			unknown = `the changed files could not be listed because ${listed.unknown}`;
 			targets = [];
 		} else {
-			repo = listed.repo;
+			tree = listed.tree;
 			targets = listed.targets;
 		}
 	} else {
@@ -1022,7 +1141,7 @@ export const archiveCommand = (options: {
 		ruleId: verdict.ruleId,
 		now,
 		destruction,
-		repo,
+		tree,
 		unknown,
 		later,
 		kept: { kind: "copied", copied, notCopied },
