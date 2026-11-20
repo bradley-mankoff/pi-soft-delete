@@ -38,9 +38,10 @@ const noteOf = (archive: string): string => readFileSync(join(archive, "note.md"
 const clearWorkspace = (workspace: Workspace): void => rmSync(workspace.dir, { recursive: true, force: true });
 
 /**
- * A scratch folder outside the temporary folders, so a recursive delete needs a copy, and
- * outside every home folder, so the tests touch the real home folder nowhere. /Users/Shared
- * is the one writable folder on a Mac that is neither temporary nor inside a home folder.
+ * A scratch folder outside the temporary folders, so a recursive delete and a forced worktree
+ * removal need a copy, and outside every home folder, so the tests touch the real home folder
+ * nowhere. /Users/Shared is the one writable folder on a Mac that is neither temporary nor
+ * inside a home folder.
  */
 const outsideTemporaryFolders = (prefix: string): string => mkdtempSync(join("/Users/Shared", prefix));
 
@@ -174,6 +175,44 @@ test("git reset --hard archives every changed and untracked file", async () => {
 		assert.equal(readFileSync(join(archive, "files", "changed.txt"), "utf8"), "changed in the working tree\n");
 		assert.equal(readFileSync(join(archive, "files", "fresh.txt"), "utf8"), "untracked and new\n");
 	} finally {
+		clearWorkspace(workspace);
+	}
+});
+
+test("git worktree remove --force archives the linked worktree's changed and untracked files and the note restores them", async () => {
+	const workspace = makeWorkspace();
+	const parent = outsideTemporaryFolders("pi-soft-delete-worktree-");
+	const repo = join(parent, "repo");
+	initScratchRepo(repo);
+	const worktree = join(parent, "worktree");
+	try {
+		commitFiles(repo, { "notes.txt": "the committed notes\n" });
+		execFileSync("git", ["-C", repo, "worktree", "add", "-q", "-b", "feature", worktree]);
+		writeFileSync(join(worktree, "notes.txt"), "the uncommitted notes in the linked worktree\n");
+		writeFileSync(join(worktree, "draft.txt"), "an untracked draft in the linked worktree\n");
+
+		const handlers = loadSoftDelete(workspace.settings);
+		const result = await driveToolCall(handlers, workspace, `git worktree remove --force ${worktree}`, repo);
+
+		assert.equal(result, undefined, "the handler must not block the command");
+		const archive = onlyArchive(workspace);
+		assert.equal(
+			readFileSync(join(archive, "files", "notes.txt"), "utf8"),
+			"the uncommitted notes in the linked worktree\n",
+		);
+		assert.equal(
+			readFileSync(join(archive, "files", "draft.txt"), "utf8"),
+			"an untracked draft in the linked worktree\n",
+		);
+
+		const note = noteOf(archive);
+		assert.ok(note.includes(`git worktree remove --force ${worktree}`), note);
+		assert.ok(note.includes("git.worktree-remove-force"), note);
+		assert.match(note, /restore/i);
+		assert.ok(note.includes(`git worktree add '${worktree}' 'feature'`), note);
+		assert.ok(note.includes(`cp -R '${archive}/files/.' '${worktree}/'`), note);
+	} finally {
+		rmSync(parent, { recursive: true, force: true });
 		clearWorkspace(workspace);
 	}
 });
