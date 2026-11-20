@@ -9,7 +9,7 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
-import { driveSessionStart, driveToolCall, loadSoftDelete, makeWorkspace, type Workspace } from "./stand-in-pi.ts";
+import { driveSessionStart, driveToolCall, initScratchRepo, loadSoftDelete, makeWorkspace, type Workspace } from "./stand-in-pi.ts";
 
 /** Commit the given files in the given scratch repo. */
 const commitFiles = (repo: string, files: Record<string, string>): void => {
@@ -47,9 +47,7 @@ const outsideTemporaryFolders = (prefix: string): string => mkdtempSync(join("/U
 /** A scratch git repo under a folder outside the temporary folders, for deletes of `.git`. */
 const scratchRepo = (): string => {
 	const repo = outsideTemporaryFolders("pi-soft-delete-repo-");
-	execFileSync("git", ["init", "-q", repo]);
-	execFileSync("git", ["-C", repo, "config", "user.name", "Soft Delete Test"]);
-	execFileSync("git", ["-C", repo, "config", "user.email", "test@example.invalid"]);
+	initScratchRepo(repo);
 	return repo;
 };
 
@@ -196,7 +194,8 @@ test("rm -rf .git archives the git metadata under the rule that protects it", as
 			readFileSync(join(archive, "files", repo.slice(1), ".git", "soft-delete-proof"), "utf8"),
 			"the unpushed history a deleted .git would lose\n",
 		);
-		assert.ok(noteOf(archive).includes("rm.git-metadata"), noteOf(archive));
+		const note = noteOf(archive);
+		assert.ok(note.includes("rm.git-metadata"), note);
 	} finally {
 		rmSync(repo, { recursive: true, force: true });
 		clearWorkspace(workspace);
@@ -222,11 +221,10 @@ test("a recursive delete behind a literal cd archives the folder the cd names", 
 			readFileSync(join(archive, "files", target.slice(1), "sub", "kept.txt"), "utf8"),
 			"the folder the cd names\n",
 		);
+		const note = noteOf(archive);
 		assert.ok(
-			noteOf(archive).includes(
-				`cp -R '${join(archive, "files", target.slice(1), "sub")}' '${join(target, "sub")}'`,
-			),
-			noteOf(archive),
+			note.includes(`cp -R '${join(archive, "files", target.slice(1), "sub")}' '${join(target, "sub")}'`),
+			note,
 		);
 	} finally {
 		rmSync(cwd, { recursive: true, force: true });
@@ -237,8 +235,8 @@ test("a recursive delete behind a literal cd archives the folder the cd names", 
 
 test("rm -rf of a folder outside the temporary folders archives the folder", async () => {
 	const workspace = makeWorkspace();
-	const cwd = outsideTemporaryFolders(".soft-delete-cwd-");
-	const victim = outsideTemporaryFolders(".soft-delete-victim-");
+	const cwd = outsideTemporaryFolders("pi-soft-delete-cwd-");
+	const victim = outsideTemporaryFolders("pi-soft-delete-victim-");
 	try {
 		mkdirSync(join(victim, "inner"));
 		writeFileSync(join(victim, "inner", "kept.txt"), "the folder's contents\n");
@@ -261,7 +259,7 @@ test("rm -rf of a folder outside the temporary folders archives the folder", asy
 
 test("rm -rf of a folder inside /tmp archives nothing", async () => {
 	const workspace = makeWorkspace();
-	const cwd = outsideTemporaryFolders(".soft-delete-cwd-");
+	const cwd = outsideTemporaryFolders("pi-soft-delete-cwd-");
 	const victim = mkdtempSync("/tmp/pi-soft-delete-victim-");
 	try {
 		writeFileSync(join(victim, "kept.txt"), "the temporary folder's contents\n");
@@ -322,12 +320,6 @@ test("a target over the size cap is named as over the cap even when part of it c
 	}
 });
 
-/** The date and time part of an archive folder name, in the archive's local-time format. */
-const stampOf = (when: Date): string => {
-	const pad = (value: number): string => String(value).padStart(2, "0");
-	return `${when.getFullYear()}-${pad(when.getMonth() + 1)}-${pad(when.getDate())}_${pad(when.getHours())}-${pad(when.getMinutes())}-${pad(when.getSeconds())}`;
-};
-
 /** A folder in the archive root as an earlier run left it, backdated by name and mtime. */
 const backdatedArchive = (workspace: Workspace, name: string, when: Date): string => {
 	const folder = join(workspace.archiveRoot, name);
@@ -357,11 +349,13 @@ test("an archive older than the keep-days is deleted when the next archive is wr
 test("archives older than the keep-days are deleted when a session starts", async () => {
 	const workspace = makeWorkspace();
 	try {
-		const old = backdatedArchive(workspace, "2020-01-01_00-00-00_git.checkout-double-dash", new Date("2020-01-01T00:00:00Z"));
-		const now = new Date();
-		const recent = backdatedArchive(workspace, `${stampOf(now)}_git.checkout-double-dash`, now);
-
+		commitFiles(workspace.repo, { "notes.txt": "committed\n" });
+		writeFileSync(join(workspace.repo, "notes.txt"), "uncommitted\n");
 		const handlers = loadSoftDelete(workspace.settings);
+		await driveToolCall(handlers, workspace, "git checkout -- notes.txt");
+		const recent = onlyArchive(workspace);
+		const old = backdatedArchive(workspace, "2020-01-01_00-00-00_git.checkout-double-dash", new Date("2020-01-01T00:00:00Z"));
+
 		await driveSessionStart(handlers, workspace);
 
 		assert.equal(existsSync(old), false);
@@ -372,10 +366,10 @@ test("archives older than the keep-days are deleted when a session starts", asyn
 });
 
 test("the keep-days setting decides how old an archive may be", async () => {
-	const workspace = makeWorkspace({ keepDays: 30 });
+	// 100 years, so an archive from 2000 survives, where the default 7 days would delete it.
+	const workspace = makeWorkspace({ keepDays: 36500 });
 	try {
-		const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
-		const kept = backdatedArchive(workspace, `${stampOf(tenDaysAgo)}_git.checkout-double-dash`, tenDaysAgo);
+		const kept = backdatedArchive(workspace, "2000-01-01_00-00-00_git.checkout-double-dash", new Date("2000-01-01T00:00:00Z"));
 
 		const handlers = loadSoftDelete(workspace.settings);
 		await driveSessionStart(handlers, workspace);

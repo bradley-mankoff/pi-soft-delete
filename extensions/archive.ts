@@ -95,14 +95,18 @@ const RECURSIVE_DELETE_RULES = new Set([
 	"parallel.rm-recursive-force-dynamic",
 ]);
 
-/** The delete rules whose targets another command supplies, so a note is all this package can write. */
-const UNPARSED_DELETE_RULES = new Set([
-	"find.delete",
-	"find.delete-git-metadata",
-	"find.exec-rm-recursive-force",
-	"xargs.rm-recursive-force-dynamic",
-	"parallel.rm-recursive-force-dynamic",
-]);
+/**
+ * The command that supplies the paths a refused delete would remove, when it is not rm itself:
+ * find, xargs or parallel names the targets at run time, so a note is all this package can write.
+ * The rule-id prefixes say this once for the archive and the note; a rule of one of these tools
+ * added later needs no second list.
+ */
+const targetSupplier = (ruleId: string): "find" | "xargs" | "parallel" | undefined => {
+	if (ruleId.startsWith("find.")) return "find";
+	if (ruleId.startsWith("xargs.")) return "xargs";
+	if (ruleId.startsWith("parallel.")) return "parallel";
+	return undefined;
+};
 
 /** The destruction a denied rule causes, or undefined for a rule that destroys no work this package copies. */
 const destructionOf = (ruleId: string): Destruction | undefined => {
@@ -113,6 +117,12 @@ const destructionOf = (ruleId: string): Destruction | undefined => {
 
 /** One thing to copy: where it is now, and where it goes in the archive. */
 type Target = { label: string; source: string; stored: string };
+
+/** A target this package could not copy, and why, so the note can name what was left behind. */
+type NotCopied = { label: string; why: string };
+
+/** Where a command word sits in the tokens, counting `/bin/rm` as `rm`. */
+const wordIndex = (tokens: string[], word: string): number => tokens.findIndex((token) => token.split("/").pop() === word);
 
 /** Split a command into words the way sh quotes them, keeping operators as their own words. */
 const tokenize = (command: string): string[] => {
@@ -161,6 +171,7 @@ const tokenize = (command: string): string[] => {
 /** A word sh would expand before rm sees it: a variable, a glob or command substitution. */
 const isDynamic = (word: string): boolean => /[$`*?\[\]{}]/.test(word) || (word.startsWith("~") && word !== "~" && !word.startsWith("~/"));
 
+/** The tokens that end a command's arguments. */
 const OPERATORS = ["&", "|", ";", ">", "<"];
 
 /** The tokens that separate one statement from the next; a redirection stays inside its statement. */
@@ -174,7 +185,7 @@ const STATEMENT_SEPARATORS = ["&", "|", ";"];
  * copy. Git and rm share this reading, so `cd <folder> && <command>` lands in the folder the
  * cd names for either.
  */
-const folderBefore = (tokens: string[], commandAt: number, cwd: string, name: string): { folder: string } | { unknown: string } => {
+const folderBefore = (tokens: string[], commandAt: number, cwd: string, commandWord: string): { folder: string } | { unknown: string } => {
 	let folder = cwd;
 	let statementStart = true;
 	for (let index = 0; index < commandAt; index += 1) {
@@ -184,7 +195,7 @@ const folderBefore = (tokens: string[], commandAt: number, cwd: string, name: st
 			continue;
 		}
 		if (!statementStart || token.split("/").pop() !== "cd") {
-			return { unknown: `the command runs \`${token}\` before ${name}, so its folder cannot be read` };
+			return { unknown: `the command runs \`${token}\` before ${commandWord}, so its folder cannot be read` };
 		}
 		const target = tokens[index + 1];
 		if (target === undefined || target === "-" || isDynamic(target)) {
@@ -196,6 +207,12 @@ const folderBefore = (tokens: string[], commandAt: number, cwd: string, name: st
 	}
 	return { folder };
 };
+
+/** git's global options that take the next word as their value. */
+const GIT_OPTIONS_TAKING_A_VALUE = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"]);
+
+/** Those of them whose value is a folder, so a leading `~` is resolved before git reads it. */
+const GIT_FOLDER_OPTIONS = new Set(["-C", "--git-dir", "--work-tree", "--exec-path"]);
 
 /**
  * The global options before a git subcommand (`-C <path>`, `--git-dir`, and the like), which
@@ -209,11 +226,11 @@ const gitGlobalOptions = (tokens: string[], gitAt: number): { options: string[] 
 		if (!token.startsWith("-") || token === "-" || OPERATORS.includes(token)) break;
 		if (isDynamic(token)) return { unknown: `the option \`${token}\` names a folder that cannot be resolved` };
 		options.push(token);
-		if (!["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"].includes(token)) continue;
+		if (!GIT_OPTIONS_TAKING_A_VALUE.has(token)) continue;
 		const value = tokens[index + 1];
 		if (value === undefined) return { unknown: `the option \`${token}\` has no value` };
-		if (isDynamic(value)) return { unknown: `the value \`${value}\` of ${token} names a folder that cannot be resolved` };
-		options.push(["-C", "--git-dir", "--work-tree", "--exec-path"].includes(token) ? expandTilde(value) : value);
+		if (isDynamic(value)) return { unknown: `the value \`${value}\` of ${token} cannot be read` };
+		options.push(GIT_FOLDER_OPTIONS.has(token) ? expandTilde(value) : value);
 		index += 1;
 	}
 	return { options };
@@ -222,7 +239,7 @@ const gitGlobalOptions = (tokens: string[], gitAt: number): { options: string[] 
 /** The repository a git command runs in, and every changed and untracked file git status lists in it. */
 const gitTargets = (command: string, cwd: string): { repo: string; targets: Target[] } | { unknown: string } => {
 	const tokens = tokenize(command);
-	const gitAt = tokens.findIndex((token) => token.split("/").pop() === "git");
+	const gitAt = wordIndex(tokens, "git");
 	if (gitAt === -1) return { unknown: "the command does not name a git whose folder could be read" };
 	const placed = folderBefore(tokens, gitAt, cwd, "git");
 	if ("unknown" in placed) return placed;
@@ -286,14 +303,14 @@ const isTemporary = (path: string): boolean => {
  */
 const deleteTargets = (command: string, cwd: string): { paths: string[] } | { unknown: string } => {
 	const tokens = tokenize(command);
-	const rmAt = tokens.findIndex((token) => token.split("/").pop() === "rm");
+	const rmAt = wordIndex(tokens, "rm");
 	if (rmAt === -1) return { unknown: "the command does not name an rm whose targets could be read" };
 	const placed = folderBefore(tokens, rmAt, cwd, "rm");
 	if ("unknown" in placed) return placed;
 	const operands: string[] = [];
 	let optionsEnded = false;
 	for (const token of tokens.slice(rmAt + 1)) {
-		if (["&", "|", ";", ">", "<"].includes(token)) break;
+		if (OPERATORS.includes(token)) break;
 		if (!optionsEnded && token === "--") {
 			optionsEnded = true;
 			continue;
@@ -387,13 +404,8 @@ export const purgeArchives = (settings: SoftDeleteSettings, now: Date = new Date
 };
 
 /** The command word whose statement cc-safety-net refused, so the parts after that statement can be named. */
-const refusedWord = (destruction: Destruction, ruleId: string): string => {
-	if (destruction === "git-discard") return "git";
-	if (ruleId.startsWith("find.")) return "find";
-	if (ruleId.startsWith("xargs.")) return "xargs";
-	if (ruleId.startsWith("parallel.")) return "parallel";
-	return "rm";
-};
+const refusedWord = (destruction: Destruction, ruleId: string): string =>
+	destruction === "git-discard" ? "git" : (targetSupplier(ruleId) ?? "rm");
 
 /**
  * The statements a command runs after the one that holds the refused command, as written.
@@ -440,7 +452,7 @@ const writeNote = (options: {
 	unknown: string | undefined;
 	later: string[];
 	copied: Target[];
-	notCopied: { label: string; why: string }[];
+	notCopied: NotCopied[];
 }): void => {
 	const { archive, command, cwd, sessionFile, ruleId, now, destruction, repo, unknown, later, copied, notCopied } = options;
 	const lines = [
@@ -488,9 +500,8 @@ export const archiveCommand = (options: {
 	cwd: string;
 	sessionFile: string | undefined;
 	settings: SoftDeleteSettings;
-	now?: Date;
 }): string | undefined => {
-	const { command, cwd, sessionFile, settings, now = new Date() } = options;
+	const { command, cwd, sessionFile, settings } = options;
 	if (command.trim() === "" || !isAbsolute(cwd)) return undefined;
 	const verdict = checkCommand({ command, cwd });
 	if (verdict.kind !== "deny") return undefined;
@@ -510,7 +521,7 @@ export const archiveCommand = (options: {
 			targets = listed.targets;
 		}
 	} else {
-		if (UNPARSED_DELETE_RULES.has(verdict.ruleId)) {
+		if (targetSupplier(verdict.ruleId) !== undefined) {
 			unknown = "the command's targets could not be worked out: another command (a pipe, xargs or find) supplies them";
 			targets = [];
 		} else {
@@ -525,13 +536,14 @@ export const archiveCommand = (options: {
 		}
 	}
 
+	const now = new Date();
 	purgeArchives(settings, now);
 	const tokens = tokenize(command);
 	const word = refusedWord(destruction, verdict.ruleId);
-	const later = laterStatements(tokens, tokens.findIndex((token) => token.split("/").pop() === word));
+	const later = laterStatements(tokens, wordIndex(tokens, word));
 	const archive = uniqueFolder(settings.archiveRoot, folderName(now, verdict.ruleId));
 	const copied: Target[] = [];
-	const notCopied: { label: string; why: string }[] = [];
+	const notCopied: NotCopied[] = [];
 	mkdirSync(archive, { recursive: true });
 	for (const target of targets) {
 		const destination = join(archive, target.stored);

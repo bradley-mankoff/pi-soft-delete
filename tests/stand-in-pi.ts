@@ -14,13 +14,8 @@ import type {
 	ToolCallEvent,
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
+import type { SoftDeleteSettings } from "../extensions/archive.ts";
 import softDelete from "../extensions/soft-delete.ts";
-
-export type SoftDeleteSettings = {
-	archiveRoot: string;
-	keepDays: number;
-	maxBytes: number;
-};
 
 export type Workspace = {
 	/** The one temporary folder every other path lives under. */
@@ -32,6 +27,13 @@ export type Workspace = {
 	settings: { softDelete: SoftDeleteSettings };
 };
 
+/** Make a folder a git repository whose commits need no global identity. */
+export const initScratchRepo = (repo: string): void => {
+	execFileSync("git", ["init", "-q", repo]);
+	execFileSync("git", ["-C", repo, "config", "user.name", "Soft Delete Test"]);
+	execFileSync("git", ["-C", repo, "config", "user.email", "test@example.invalid"]);
+};
+
 /** One temporary machine: a scratch git repo, an archive root, and cc-safety-net's home. */
 export const makeWorkspace = (overrides: Partial<SoftDeleteSettings> = {}): Workspace => {
 	const dir = mkdtempSync(join(tmpdir(), "pi-soft-delete-"));
@@ -41,9 +43,7 @@ export const makeWorkspace = (overrides: Partial<SoftDeleteSettings> = {}): Work
 	const sessionFile = join(dir, "session.jsonl");
 	mkdirSync(repo, { recursive: true });
 	mkdirSync(safetyNetHome, { recursive: true });
-	execFileSync("git", ["init", "-q", repo]);
-	execFileSync("git", ["-C", repo, "config", "user.name", "Soft Delete Test"]);
-	execFileSync("git", ["-C", repo, "config", "user.email", "test@example.invalid"]);
+	initScratchRepo(repo);
 	return {
 		dir,
 		repo,
