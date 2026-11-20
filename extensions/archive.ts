@@ -3,12 +3,12 @@
  * note saying what was destroyed and how to put it back.
  *
  * A command is only archived when cc-safety-net would refuse it under a rule this package
- * knows destroys work: the git commands that discard uncommitted changes, and recursive
- * deletes. Nothing here decides whether the command runs; the caller lets it run either
- * way, and a failure to archive is reported in the note instead of thrown.
+ * knows destroys work: the git commands that discard uncommitted changes or move a ref, and
+ * recursive deletes. Nothing here decides whether the command runs; the caller lets it run
+ * either way, and a failure to archive is reported in the note instead of thrown.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { checkCommand } from "cc-safety-net/api";
@@ -53,7 +53,7 @@ export const settingsOf = (settings: unknown): SoftDeleteSettings => {
 };
 
 /** What kind of destruction a rule causes, when this package keeps a copy for it. */
-type Destruction = "git-discard" | "recursive-delete";
+type Destruction = "git-discard" | "git-ref" | "recursive-delete";
 
 /**
  * The rule ids whose denial means work is about to be destroyed, and what kind, matched by the
@@ -78,6 +78,20 @@ const GIT_DISCARD_RULES = new Set([
 	"git.stash-drop",
 	"git.switch-discard-changes",
 	"git.switch-force",
+]);
+
+/**
+ * The rule ids whose denial means a git ref is about to move or disappear, taking the commits
+ * only it could reach. A force push is denied as `git.push-force` whether it names a ref, uses
+ * `+` in the refspec, or carries a lease alongside `--force`; `--force-with-lease` alone is
+ * allowed, so this package never has to archive it.
+ */
+const GIT_REF_RULES = new Set([
+	"git.branch-force-delete",
+	"git.push-delete",
+	"git.push-force",
+	"git.push-mirror",
+	"git.tag-delete",
 ]);
 
 const RECURSIVE_DELETE_RULES = new Set([
@@ -111,6 +125,7 @@ const targetSupplier = (ruleId: string): "find" | "xargs" | "parallel" | undefin
 /** The destruction a denied rule causes, or undefined for a rule that destroys no work this package copies. */
 const destructionOf = (ruleId: string): Destruction | undefined => {
 	if (GIT_DISCARD_RULES.has(ruleId)) return "git-discard";
+	if (GIT_REF_RULES.has(ruleId)) return "git-ref";
 	if (RECURSIVE_DELETE_RULES.has(ruleId)) return "recursive-delete";
 	return undefined;
 };
@@ -236,8 +251,15 @@ const gitGlobalOptions = (tokens: string[], gitAt: number): { options: string[] 
 	return { options };
 };
 
-/** The repository a git command runs in, and every changed and untracked file git status lists in it. */
-const gitTargets = (command: string, cwd: string): { repo: string; targets: Target[] } | { unknown: string } => {
+/** Where a git command runs and which repository it names, after its global options. */
+type GitPlacement = { repo: string; tokens: string[]; gitAt: number; options: string[] };
+
+/**
+ * The repository a git command names, read from the tool call's folder and the absolute options
+ * that choose another (`-C`, `--git-dir`, ...). Git and every subcommand share this reading, so
+ * `cd <folder> && git ...` and `git -C <folder> ...` archive from the repository they name.
+ */
+const gitPlacement = (command: string, cwd: string): GitPlacement | { unknown: string } => {
 	const tokens = tokenize(command);
 	const gitAt = wordIndex(tokens, "git");
 	if (gitAt === -1) return { unknown: "the command does not name a git whose folder could be read" };
@@ -245,12 +267,17 @@ const gitTargets = (command: string, cwd: string): { repo: string; targets: Targ
 	if ("unknown" in placed) return placed;
 	const parsed = gitGlobalOptions(tokens, gitAt);
 	if ("unknown" in parsed) return parsed;
-	const git = [...parsed.options];
-	const top = spawnSync("git", [...git, "rev-parse", "--show-toplevel"], { cwd: placed.folder, encoding: "utf8" });
+	const top = spawnSync("git", [...parsed.options, "rev-parse", "--show-toplevel"], { cwd: placed.folder, encoding: "utf8" });
 	if (top.status !== 0) return { unknown: "the folder is not a git repository" };
-	const repo = top.stdout.trim();
-	const status = spawnSync("git", [...git, "status", "--porcelain=v1", "-z", "--untracked-files=all"], {
-		cwd: placed.folder,
+	return { repo: top.stdout.trim(), tokens, gitAt, options: parsed.options };
+};
+
+/** The repository a git command runs in, and every changed and untracked file git status lists in it. */
+const gitTargets = (command: string, cwd: string): { repo: string; targets: Target[] } | { unknown: string } => {
+	const placement = gitPlacement(command, cwd);
+	if ("unknown" in placement) return placement;
+	const status = spawnSync("git", [...placement.options, "status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+		cwd: placement.repo,
 		encoding: "utf8",
 	});
 	if (status.status !== 0) return { unknown: "git status failed" };
@@ -262,9 +289,376 @@ const gitTargets = (command: string, cwd: string): { repo: string; targets: Targ
 		const state = entry.slice(0, 2);
 		const path = entry.slice(3);
 		if (state.includes("R") || state.includes("C")) index += 1;
-		targets.push({ label: path, source: join(repo, path), stored: join("files", path) });
+		targets.push({ label: path, source: join(placement.repo, path), stored: join("files", path) });
 	}
-	return { repo, targets };
+	return { repo: placement.repo, targets };
+};
+
+/** Run git in a repository, answering its output or the first line of what went wrong. */
+const runGit = (repo: string, args: string[]): { ok: true; stdout: string } | { ok: false; why: string } => {
+	const result = spawnSync("git", args, { cwd: repo, encoding: "utf8" });
+	if (result.status === 0) return { ok: true, stdout: result.stdout.trim() };
+	const why = (result.stderr || result.stdout || `git ${args.join(" ")} failed`).trim().split("\n")[0] ?? "git failed";
+	return { ok: false, why };
+};
+
+/** A ref inside a bundle, with its old tip and where the restore puts it back. */
+type KeptRef = { label: string; tip: string; head: string; restore: string };
+
+/** A bundle holding one ref, or every ref a mirror push can move. */
+type KeptBundle = { stored: string; refs: KeptRef[] };
+
+/** A ref this package meant to bundle but could not, and why, so the note names what was lost. */
+type NotKeptRef = { label: string; why: string };
+
+/** One bundle to write: the refs it holds, and the temporary refs to delete once it does. */
+type BundlePlan = { label: string; stored: string; refs: KeptRef[]; cleanup: string[] };
+
+/** A ref name made safe for a file name or a ref path component. */
+const bundleSlug = (name: string): string => name.replace(/[^A-Za-z0-9._-]/g, "-").replace(/^-+/, "");
+
+/** A ref's name without the namespace that says whether it is a branch or a tag. */
+const shortRef = (ref: string): string => ref.replace(/^refs\/(?:heads|tags)\//, "");
+
+/** The kind of ref a full name holds, for a file name or a temporary ref of its own. */
+const refKind = (ref: string): "branch" | "tag" | "ref" =>
+	ref.startsWith("refs/tags/") ? "tag" : ref.startsWith("refs/heads/") ? "branch" : "ref";
+
+/** The file a bundle of these refs is stored under, named so two refs never share one by accident. */
+const bundleStored = (owner: string, ref: string): string =>
+	join("bundles", `${bundleSlug(`${owner}-${refKind(ref)}-${shortRef(ref)}`)}.bundle`);
+
+/** Whether a local ref exists, without letting git print its answer. */
+const localRefExists = (repo: string, ref: string): boolean => runGit(repo, ["show-ref", "--verify", "--quiet", ref]).ok;
+
+/**
+ * A plan that bundles an existing local ref. A force-deleted branch or tag still exists while
+ * the command is being archived, so the bundle names it as it stands and the restore's fetch
+ * puts the same name back.
+ */
+const localRefPlan = (repo: string, ref: string, label: string): { plan?: BundlePlan; missing?: NotKeptRef } => {
+	const tip = runGit(repo, ["rev-parse", "--verify", ref]);
+	if (!tip.ok) return { missing: { label, why: `the ref could not be read: ${tip.why}` } };
+	return {
+		plan: {
+			label,
+			stored: bundleStored("local", ref),
+			refs: [{ label, tip: tip.stdout, head: ref, restore: ref }],
+			cleanup: [],
+		},
+	};
+};
+
+/**
+ * A plan that bundles a remote ref, fetched into a temporary ref of this package's own so the
+ * bundle holds the remote's tip as it is now rather than a stale remote-tracking copy. The
+ * temporary ref lives only until the bundle is written; its name is the head the note tells the
+ * reader to fetch back.
+ */
+const remoteRefPlan = (
+	repo: string,
+	remote: string,
+	candidates: string[],
+	label: string,
+): { plan?: BundlePlan; missing?: NotKeptRef } => {
+	const failures: string[] = [];
+	for (const ref of candidates) {
+		const head = `refs/soft-delete-archive/${process.pid}/${bundleSlug(`${remote}-${refKind(ref)}-${shortRef(ref)}`)}`;
+		const fetched = runGit(repo, ["fetch", "--no-tags", remote, `+${ref}:${head}`]);
+		if (!fetched.ok) {
+			runGit(repo, ["update-ref", "-d", head]);
+			failures.push(fetched.why);
+			continue;
+		}
+		const tip = runGit(repo, ["rev-parse", "--verify", head]);
+		if (!tip.ok) {
+			runGit(repo, ["update-ref", "-d", head]);
+			failures.push(tip.why);
+			continue;
+		}
+		return {
+			plan: {
+				label,
+				stored: bundleStored(remote, ref),
+				refs: [{ label, tip: tip.stdout, head, restore: ref }],
+				cleanup: [head],
+			},
+		};
+	}
+	return { missing: { label, why: `the remote ref could not be fetched: ${failures.join("; ")}` } };
+};
+
+/** The git subcommand after a git command's global options, and where it sits in the tokens. */
+const gitSubcommand = (tokens: string[], gitAt: number): { at: number; name: string } | undefined => {
+	for (let index = gitAt + 1; index < tokens.length; index += 1) {
+		const token = tokens[index];
+		if (!token.startsWith("-") || token === "-") return { at: index, name: token };
+		if (GIT_OPTIONS_TAKING_A_VALUE.has(token)) index += 1;
+	}
+	return undefined;
+};
+
+/** git push options that take the next word as their value, rather than `=` on the same word. */
+const PUSH_OPTIONS_TAKING_A_VALUE = new Set(["-o", "--push-option", "--repo", "--receive-pack", "--exec", "--recurse-submodules"]);
+
+/** What a push command says about its remote and the refs it moves. */
+type PushSpec = {
+	delete: boolean;
+	mirror: boolean;
+	all: boolean;
+	tags: boolean;
+	remote: string;
+	refspecs: string[];
+};
+
+/** The remote a push without one named uses: the branch's push remote, then the user's default, then origin. */
+const defaultRemote = (repo: string): string => {
+	const branch = runGit(repo, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+	const keys = [
+		...(branch.ok ? [`branch.${branch.stdout}.pushRemote`, "remote.pushDefault", `branch.${branch.stdout}.remote`] : ["remote.pushDefault"]),
+	];
+	for (const key of keys) {
+		const configured = runGit(repo, ["config", "--get", key]);
+		if (configured.ok && configured.stdout !== "" && configured.stdout !== ".") return configured.stdout;
+	}
+	return "origin";
+};
+
+/** The branch checked out in a repository, or undefined when HEAD is detached. */
+const currentBranch = (repo: string): string | undefined => {
+	const head = runGit(repo, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+	return head.ok ? head.stdout : undefined;
+};
+
+/** Read a git push command's options, remote and refspecs; the first operand is always the remote. */
+const parsePush = (tokens: string[], start: number, repo: string): PushSpec => {
+	let del = false;
+	let mirror = false;
+	let all = false;
+	let tags = false;
+	const operands: string[] = [];
+	let optionsEnded = false;
+	for (let index = start; index < tokens.length; index += 1) {
+		const token = tokens[index];
+		if (OPERATORS.includes(token)) break;
+		if (!optionsEnded && token === "--") {
+			optionsEnded = true;
+			continue;
+		}
+		if (!optionsEnded && token.startsWith("-") && token !== "-") {
+			if (token === "--delete" || token === "-d" || /^-[A-Za-z]*d/.test(token)) del = true;
+			if (token === "--mirror") mirror = true;
+			if (token === "--all" || token === "--branches") all = true;
+			if (token === "--tags") tags = true;
+			const option = token.split("=", 1)[0];
+			if (PUSH_OPTIONS_TAKING_A_VALUE.has(option) && !token.includes("=")) index += 1;
+			continue;
+		}
+		operands.push(token);
+	}
+	const [namedRemote, ...refspecs] = operands;
+	return { delete: del, mirror, all, tags, remote: namedRemote ?? defaultRemote(repo), refspecs };
+};
+
+/** What a refspec moves: the ref on the remote, and whether the command deletes it. */
+type RefMove = { remoteRef: string; delete: boolean };
+
+/** The remote ref a refspec names, reading `:old`, `old`, `src:old`, `+old` and their full forms alike. */
+const refMoveOf = (repo: string, refspec: string, deleting: boolean): RefMove => {
+	const body = refspec.startsWith("+") ? refspec.slice(1) : refspec;
+	if (deleting) return { remoteRef: body.startsWith(":") ? body.slice(1) : body, delete: true };
+	if (body.startsWith(":")) return { remoteRef: body.slice(1), delete: true };
+	const colon = body.indexOf(":");
+	const source = colon === -1 ? body : body.slice(0, colon);
+	const destination = colon === -1 ? body : body.slice(colon + 1);
+	if (destination === "") return { remoteRef: source, delete: true };
+	if (destination.startsWith("refs/")) return { remoteRef: destination, delete: false };
+	const sourceIsTag =
+		source.startsWith("refs/tags/") ||
+		(source !== "" && localRefExists(repo, `refs/tags/${source}`) && !localRefExists(repo, `refs/heads/${source}`));
+	return { remoteRef: `${sourceIsTag ? "refs/tags" : "refs/heads"}/${destination}`, delete: false };
+};
+
+/** One bundle plan per remote ref a push moves, fetching each first so its old tip is current. */
+const pushPlans = (repo: string, spec: PushSpec): { plans: BundlePlan[]; missing: NotKeptRef[]; unknown?: string } => {
+	if (spec.mirror) {
+		const listed = runGit(repo, ["ls-remote", "--refs", "--heads", "--tags", spec.remote]);
+		if (!listed.ok) {
+			return { plans: [], missing: [{ label: `the refs on ${spec.remote}`, why: `the remote could not be listed: ${listed.why}` }] };
+		}
+		const remoteRefs = listed.stdout
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => line.split("\t")[1] ?? "")
+			.filter(Boolean);
+		if (remoteRefs.length === 0) return { plans: [], missing: [], unknown: `the remote ${spec.remote} reports no ref to keep` };
+		const refs: KeptRef[] = [];
+		const cleanup: string[] = [];
+		const missing: NotKeptRef[] = [];
+		for (const remoteRef of remoteRefs) {
+			const head = `refs/soft-delete-archive/${process.pid}/${bundleSlug(`${spec.remote}-${refKind(remoteRef)}-${shortRef(remoteRef)}`)}`;
+			const fetched = runGit(repo, ["fetch", "--no-tags", spec.remote, `+${remoteRef}:${head}`]);
+			if (!fetched.ok) {
+				runGit(repo, ["update-ref", "-d", head]);
+				missing.push({ label: `${spec.remote}/${shortRef(remoteRef)}`, why: `the remote ref could not be fetched: ${fetched.why}` });
+				continue;
+			}
+			const tip = runGit(repo, ["rev-parse", "--verify", head]);
+			if (!tip.ok) {
+				runGit(repo, ["update-ref", "-d", head]);
+				missing.push({ label: `${spec.remote}/${shortRef(remoteRef)}`, why: `the remote ref could not be read: ${tip.why}` });
+				continue;
+			}
+			refs.push({ label: `${spec.remote}/${shortRef(remoteRef)}`, tip: tip.stdout, head, restore: remoteRef });
+			cleanup.push(head);
+		}
+		if (refs.length === 0) return { plans: [], missing };
+		return {
+			plans: [{ label: `every ref on ${spec.remote}`, stored: join("bundles", `${bundleSlug(spec.remote)}-mirror.bundle`), refs, cleanup }],
+			missing,
+		};
+	}
+
+	const plans: BundlePlan[] = [];
+	const missing: NotKeptRef[] = [];
+	const add = (remoteRef: string): void => {
+		const label = `${spec.remote}/${shortRef(remoteRef)}`;
+		const kept = remoteRefPlan(repo, spec.remote, [remoteRef], label);
+		if (kept.plan) plans.push(kept.plan);
+		if (kept.missing) missing.push(kept.missing);
+	};
+
+	if (spec.all || spec.tags) {
+		const namespace = spec.all ? "refs/heads" : "refs/tags";
+		const listed = runGit(repo, ["for-each-ref", "--format=%(refname)", namespace]);
+		if (!listed.ok) return { plans, missing, unknown: `the refs could not be listed: ${listed.why}` };
+		const refs = listed.stdout.split("\n").filter(Boolean);
+		if (refs.length === 0) return { plans, missing, unknown: "the command names no ref to push" };
+		for (const ref of refs) add(ref);
+		return { plans, missing };
+	}
+
+	if (spec.refspecs.length === 0) {
+		const branch = currentBranch(repo);
+		if (branch === undefined) return { plans, missing, unknown: "the command pushes the current branch, and HEAD is detached" };
+		add(`refs/heads/${branch}`);
+		return { plans, missing };
+	}
+
+	for (const refspec of spec.refspecs) {
+		const move = refMoveOf(repo, refspec, spec.delete);
+		if (move.remoteRef === "") return { plans, missing, unknown: `the refspec \`${refspec}\` names no ref` };
+		if (move.delete) {
+			const label = `${spec.remote}/${shortRef(move.remoteRef)}`;
+			const candidates = move.remoteRef.startsWith("refs/")
+				? [move.remoteRef]
+				: [`refs/heads/${move.remoteRef}`, `refs/tags/${move.remoteRef}`];
+			const kept = remoteRefPlan(repo, spec.remote, candidates, label);
+			if (kept.plan) plans.push(kept.plan);
+			if (kept.missing) missing.push(kept.missing);
+			continue;
+		}
+		add(move.remoteRef);
+	}
+	return { plans, missing };
+};
+
+/** The refs a refused branch or tag deletion removes, as bundle plans. */
+const localDeletePlans = (repo: string, tokens: string[], start: number, namespace: "refs/heads" | "refs/tags"): { plans: BundlePlan[]; missing: NotKeptRef[]; unknown?: string } => {
+	const names: string[] = [];
+	let optionsEnded = false;
+	for (let index = start; index < tokens.length; index += 1) {
+		const token = tokens[index];
+		if (OPERATORS.includes(token)) break;
+		if (!optionsEnded && token === "--") {
+			optionsEnded = true;
+			continue;
+		}
+		if (!optionsEnded && token.startsWith("-") && token !== "-") continue;
+		names.push(token);
+	}
+	if (names.length === 0) return { plans: [], missing: [], unknown: "the command names no ref to delete" };
+	const plans: BundlePlan[] = [];
+	const missing: NotKeptRef[] = [];
+	for (const name of names) {
+		const ref = `${namespace}/${name}`;
+		const kept = localRefPlan(repo, ref, name);
+		if (kept.plan) plans.push(kept.plan);
+		if (kept.missing) missing.push(kept.missing);
+	}
+	return { plans, missing };
+};
+
+/** The bundle plans for the refs a refused force push, branch delete, tag delete or mirror push moves. */
+const gitRefPlans = (
+	command: string,
+	cwd: string,
+): { repo: string; plans: BundlePlan[]; missing: NotKeptRef[]; unknown?: string } | { unknown: string } => {
+	const placement = gitPlacement(command, cwd);
+	if ("unknown" in placement) return placement;
+	const subcommand = gitSubcommand(placement.tokens, placement.gitAt);
+	if (subcommand === undefined) return { unknown: "the command names no git subcommand" };
+	const { repo, tokens } = placement;
+	if (subcommand.name === "branch") return { repo, ...localDeletePlans(repo, tokens, subcommand.at + 1, "refs/heads") };
+	if (subcommand.name === "tag") return { repo, ...localDeletePlans(repo, tokens, subcommand.at + 1, "refs/tags") };
+	if (subcommand.name === "push") return { repo, ...pushPlans(repo, parsePush(tokens, subcommand.at + 1, repo)) };
+	return { unknown: `the command moves no ref this package knows how to keep` };
+};
+
+/** Build the planned bundles and delete the temporary refs they hold, naming any that fail. */
+const writeBundles = (options: {
+	repo: string;
+	archive: string;
+	plans: BundlePlan[];
+	maxBytes: number;
+}): { bundles: KeptBundle[]; notBundled: NotKeptRef[] } => {
+	const bundles: KeptBundle[] = [];
+	const notBundled: NotKeptRef[] = [];
+	for (const plan of options.plans) {
+		const destination = join(options.archive, plan.stored);
+		try {
+			if (plan.refs.length === 0) continue;
+			mkdirSync(dirname(destination), { recursive: true });
+			const created = runGit(options.repo, ["bundle", "create", destination, ...plan.refs.map((ref) => ref.head)]);
+			if (!created.ok) {
+				rmSync(destination, { force: true });
+				notBundled.push({ label: plan.label, why: `bundle failed: ${created.why}` });
+				continue;
+			}
+			if (statSync(destination).size > options.maxBytes) {
+				rmSync(destination, { force: true });
+				notBundled.push({ label: plan.label, why: `over the ${options.maxBytes}-byte size cap` });
+				continue;
+			}
+			bundles.push({ stored: plan.stored, refs: plan.refs });
+		} catch (error) {
+			rmSync(destination, { force: true });
+			notBundled.push({ label: plan.label, why: `bundle failed: ${error instanceof Error ? error.message : String(error)}` });
+		} finally {
+			for (const ref of plan.cleanup) runGit(options.repo, ["update-ref", "-d", ref]);
+		}
+	}
+	return { bundles, notBundled };
+};
+
+/** Keep the old tips of the refs a refused command moves, as bundles the note says how to fetch back. */
+const keepGitRefs = (options: {
+	command: string;
+	cwd: string;
+	archive: string;
+	maxBytes: number;
+}): { repo: string | undefined; bundles: KeptBundle[]; notBundled: NotKeptRef[]; unknown: string | undefined } => {
+	const listed = gitRefPlans(options.command, options.cwd);
+	if ("unknown" in listed && !("repo" in listed)) {
+		return { repo: undefined, bundles: [], notBundled: [], unknown: listed.unknown };
+	}
+	const written = writeBundles({ repo: listed.repo, archive: options.archive, plans: listed.plans, maxBytes: options.maxBytes });
+	return {
+		repo: listed.repo,
+		bundles: written.bundles,
+		notBundled: [...listed.missing, ...written.notBundled],
+		unknown: listed.unknown,
+	};
 };
 
 /** Every temporary root a recursive delete may destroy without an archive. */
@@ -405,7 +799,7 @@ export const purgeArchives = (settings: SoftDeleteSettings, now: Date = new Date
 
 /** The command word whose statement cc-safety-net refused, so the parts after that statement can be named. */
 const refusedWord = (destruction: Destruction, ruleId: string): string =>
-	destruction === "git-discard" ? "git" : (targetSupplier(ruleId) ?? "rm");
+	destruction === "git-discard" || destruction === "git-ref" ? "git" : (targetSupplier(ruleId) ?? "rm");
 
 /**
  * The statements a command runs after the one that holds the refused command, as written.
@@ -439,6 +833,18 @@ const restoreLines = (destruction: Destruction, archive: string, copied: Target[
 	return copied.flatMap((target) => [`    cp -R '${join(archive, target.stored)}' '${target.label}'`]);
 };
 
+/** The fetch commands that put each bundled ref back, as the reader would run them. */
+const bundleRestoreLines = (archive: string, bundles: KeptBundle[]): string[] => {
+	if (bundles.length === 0) return [];
+	return [
+		"Fetch each ref back from its bundle; `--update-head-ok` lets the fetch also move a branch that is checked out, which `git reset --hard` then brings into the working tree:",
+		"",
+		...bundles.flatMap((bundle) =>
+			bundle.refs.map((ref) => `    git fetch --update-head-ok '${join(archive, bundle.stored)}' '+${ref.head}:${ref.restore}'`),
+		),
+	];
+};
+
 /** Write the note beside the copies: the command, where it ran, the session, the rule and the restore steps. */
 const writeNote = (options: {
 	archive: string;
@@ -453,8 +859,13 @@ const writeNote = (options: {
 	later: string[];
 	copied: Target[];
 	notCopied: NotCopied[];
+	bundles?: KeptBundle[];
+	notBundled?: NotKeptRef[];
 }): void => {
 	const { archive, command, cwd, sessionFile, ruleId, now, destruction, repo, unknown, later, copied, notCopied } = options;
+	const bundles = options.bundles ?? [];
+	const notBundled = options.notBundled ?? [];
+	const isRef = destruction === "git-ref";
 	const lines = [
 		"# Soft delete archive",
 		"",
@@ -466,7 +877,7 @@ const writeNote = (options: {
 		`- Created: ${now.toISOString()}`,
 		"",
 	];
-	if (unknown) lines.push("## Targets not worked out", "", `Nothing was copied: ${unknown}.`, "");
+	if (unknown) lines.push("## Targets not worked out", "", `Nothing was ${isRef ? "bundled" : "copied"}: ${unknown}.`, "");
 	if (later.length > 0) {
 		lines.push(
 			"## Not examined",
@@ -478,13 +889,26 @@ const writeNote = (options: {
 		);
 	}
 	lines.push("## Restore", "");
-	const restore = restoreLines(destruction, archive, copied, repo);
-	lines.push(...(restore.length > 0 ? restore : ["Nothing was copied, so there is nothing to restore."]));
-	lines.push("", "## Copied", "");
-	lines.push(...(copied.length > 0 ? copied.map((target) => `- ${target.label} (at \`${target.stored}\`)`) : ["- nothing"]));
-	if (notCopied.length > 0) {
-		lines.push("", "## Not copied", "");
-		lines.push(...notCopied.map((target) => `- ${target.label} (${target.why})`));
+	const restore = isRef ? bundleRestoreLines(archive, bundles) : restoreLines(destruction, archive, copied, repo);
+	lines.push(...(restore.length > 0 ? restore : [`Nothing was ${isRef ? "bundled" : "copied"}, so there is nothing to restore.`]));
+	if (isRef) {
+		lines.push("", "## Bundled refs", "");
+		lines.push(
+			...(bundles.length > 0
+				? bundles.flatMap((bundle) => bundle.refs.map((ref) => `- ${ref.label} was at \`${ref.tip}\` (in \`${bundle.stored}\`)`))
+				: ["- nothing"]),
+		);
+		if (notBundled.length > 0) {
+			lines.push("", "## Not bundled", "");
+			lines.push(...notBundled.map((ref) => `- ${ref.label} (${ref.why})`));
+		}
+	} else {
+		lines.push("", "## Copied", "");
+		lines.push(...(copied.length > 0 ? copied.map((target) => `- ${target.label} (at \`${target.stored}\`)`) : ["- nothing"]));
+		if (notCopied.length > 0) {
+			lines.push("", "## Not copied", "");
+			lines.push(...notCopied.map((target) => `- ${target.label} (${target.why})`));
+		}
 	}
 	lines.push("");
 	writeFileSync(join(archive, "note.md"), lines.join("\n"));
@@ -507,6 +931,34 @@ export const archiveCommand = (options: {
 	if (verdict.kind !== "deny") return undefined;
 	const destruction = destructionOf(verdict.ruleId);
 	if (!destruction) return undefined;
+
+	const tokens = tokenize(command);
+	const later = laterStatements(tokens, wordIndex(tokens, refusedWord(destruction, verdict.ruleId)));
+
+	if (destruction === "git-ref") {
+		const now = new Date();
+		purgeArchives(settings, now);
+		const archive = uniqueFolder(settings.archiveRoot, folderName(now, verdict.ruleId));
+		mkdirSync(archive, { recursive: true });
+		const kept = keepGitRefs({ command, cwd, archive, maxBytes: settings.maxBytes });
+		writeNote({
+			archive,
+			command,
+			cwd,
+			sessionFile,
+			ruleId: verdict.ruleId,
+			now,
+			destruction,
+			repo: kept.repo,
+			unknown: kept.unknown,
+			later,
+			copied: [],
+			notCopied: [],
+			bundles: kept.bundles,
+			notBundled: kept.notBundled,
+		});
+		return archive;
+	}
 
 	let repo: string | undefined;
 	let targets: Target[];
@@ -538,9 +990,6 @@ export const archiveCommand = (options: {
 
 	const now = new Date();
 	purgeArchives(settings, now);
-	const tokens = tokenize(command);
-	const word = refusedWord(destruction, verdict.ruleId);
-	const later = laterStatements(tokens, wordIndex(tokens, word));
 	const archive = uniqueFolder(settings.archiveRoot, folderName(now, verdict.ruleId));
 	const copied: Target[] = [];
 	const notCopied: NotCopied[] = [];

@@ -2,11 +2,12 @@
 
 A pi package that makes an agent's destructive shell commands recoverable instead of refused.
 
-Before pi runs a bash command, the extension asks [cc-safety-net](https://github.com/kenryu42/cc-safety-net) whether a guard would refuse it. When the answer is deny under a rule that destroys work, the extension copies what the command will destroy into a dated archive folder, writes a note on how to put it back, and then lets the command run. The command is never blocked.
+Before pi runs a bash command, the extension asks [cc-safety-net](https://github.com/kenryu42/cc-safety-net) whether a guard would refuse it. When the answer is deny under a rule that destroys work, the extension copies or bundles what the command will destroy into a dated archive folder, writes a note on how to put it back, and then lets the command run. The command is never blocked.
 
 ## What it archives
 
 - **A git discard** — `git checkout`, `git restore`, `git reset --hard`, `git clean -f`, `git stash drop` or `clear`, `git switch` with discard — keeps every changed and untracked file `git status` lists in the repository the command names, including one named by `git -C` or an earlier `cd`.
+- **A git ref move or deletion** — `git push --force` or `-f` (also when the command names a lease as well), a force push written `+<ref>`, `git branch -D`, `git push --delete <ref>` or `git push origin :<ref>`, `git tag -d`, and `git push --mirror` — keeps a git bundle of the commits each affected ref points at. A remote ref is fetched first, so the bundle holds the remote's tip as it is now rather than a stale remote-tracking copy. A bundle is self-contained, so it can be restored into any clone. A push whose only force is `--force-with-lease` is allowed by cc-safety-net and archives nothing.
 - **A recursive delete outside `/tmp` and `$TMPDIR`** keeps each named path that exists, including a `.git` folder, whose loss takes every unpushed commit and stash with it. A relative target is resolved from the folder the tool call runs in, or from the folder an earlier literal `cd` names. `rm -rf /tmp/...` archives nothing. A target inside the archive root itself is not copied.
 - **A command whose targets cannot be worked out** — a variable, a glob, a pipe into `xargs` or `find`, or another command before `git` that hides which repository it uses — gets a note only, saying so.
 
@@ -20,8 +21,9 @@ Copies are APFS clones (`cp -c`), with a plain copy as the fallback. A target la
 
 One folder per destruction, under the archive root, named for its date, time and the rule id, for example `2026-11-20_15-04-05_git.checkout-double-dash`. It holds:
 
-- `note.md` — the command, the folder it ran in, the pi session file, the rule id, what was copied, what was not, and the restore steps.
+- `note.md` — the command, the folder it ran in, the pi session file, the rule id, what was copied or bundled, what was not, and the restore steps.
 - `files/` — the copies. A git discard mirrors paths relative to the repository root, so `cp -R '<archive>/files/.' '<repo>/'` restores it. A recursive delete mirrors the deleted target's absolute path, and the note gives the exact command that restores each target.
+- `bundles/` — the commits of a moved or deleted ref, one bundle per ref, or one bundle for every ref a mirror push can move. The note gives a `git fetch --update-head-ok '<bundle>' '+<head>:<ref>'` line for each ref. `--update-head-ok` lets the fetch restore a branch that is checked out, after which `git reset --hard <branch>` brings the working tree back.
 
 Archives older than the keep-days are purged whenever a new archive is written and when a session starts. There is no scheduled job.
 
