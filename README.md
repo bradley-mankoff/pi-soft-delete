@@ -6,9 +6,9 @@ Before pi runs a bash command, the extension asks [cc-safety-net](https://github
 
 ## What it archives
 
-- **A git discard** — `git checkout`, `git restore`, `git reset --hard`, `git clean -f`, `git stash drop` or `clear`, `git switch` with discard — keeps every changed and untracked file `git status` lists in that repository.
-- **A recursive delete outside `/tmp` and `$TMPDIR`** keeps each named path that exists. `rm -rf /tmp/...` archives nothing. A target inside the archive root itself is not copied.
-- **A command whose targets cannot be worked out** — a variable, a glob, or a pipe into `xargs` or `find` — gets a note only, saying so.
+- **A git discard** — `git checkout`, `git restore`, `git reset --hard`, `git clean -f`, `git stash drop` or `clear`, `git switch` with discard — keeps every changed and untracked file `git status` lists in the repository the command names, including one named by `git -C` or an earlier `cd`.
+- **A recursive delete outside `/tmp` and `$TMPDIR`** keeps each named path that exists, including a `.git` folder, whose loss takes every unpushed commit and stash with it. `rm -rf /tmp/...` archives nothing. A target inside the archive root itself is not copied.
+- **A command whose targets cannot be worked out** — a variable, a glob, a pipe into `xargs` or `find`, or another command before `git` that hides which repository it uses — gets a note only, saying so.
 
 Rules that only read, including every `secret.*` rule, archive nothing because reading destroys nothing.
 
@@ -60,4 +60,4 @@ npm install
 npm test
 ```
 
-The tests use Node's test runner, a stand-in pi, and real scratch repositories under a temporary folder. They point the archive root and cc-safety-net's home (`CC_SAFETY_NET_HOME`) at temporary folders, so they never touch the real home folder.
+The tests use Node's test runner, a stand-in pi, and real scratch repositories under a temporary folder. They point the archive root and cc-safety-net's home (`CC_SAFETY_NET_HOME`) at temporary folders. The one test that needs a folder outside the temporary folders makes its scratch folders under `/Users/Shared`, which is outside every home folder, so no test reads or writes the real home folder.

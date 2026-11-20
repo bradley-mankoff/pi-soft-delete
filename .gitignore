@@ -6,6 +6,3 @@ node_modules/
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
-
-# Scratch folders the tests make outside the temporary folders
-.soft-delete-*

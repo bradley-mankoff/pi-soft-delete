@@ -55,42 +55,64 @@ export const settingsOf = (settings: unknown): SoftDeleteSettings => {
 /** What kind of destruction a rule causes, when this package keeps a copy for it. */
 type Destruction = "git-discard" | "recursive-delete";
 
-const GIT_DISCARD_RULE = /^git\.(?:checkout-|restore-|reset-(?:hard|merge)$|clean-force$|stash-(?:drop|clear)$|switch-(?:discard-changes|force)$)/;
-const RECURSIVE_DELETE_RULE = /(?:recursive-delete|recursive-force)|^find\.delete/;
-const UNPARSED_DELETE_RULE = /^(?:xargs|find|parallel)\./;
+/**
+ * The rule ids whose denial means work is about to be destroyed, and what kind, matched by the
+ * exact id cc-safety-net reports. Matching by substring misses ids such as `rm.git-metadata`,
+ * whose name says what it protects rather than how it destroys, and catches ids of other kinds
+ * (analysis or policy) that only mention destruction. cc-safety-net is pinned at 2.8.1; a rule
+ * it adds later needs its id here. Only the POSIX rules appear: this package copies with `cp`
+ * and treats /tmp as temporary, so its home is macOS.
+ */
+const GIT_DISCARD_RULES = new Set([
+	"git.checkout-ambiguous",
+	"git.checkout-double-dash",
+	"git.checkout-force",
+	"git.checkout-pathspec-from-file",
+	"git.checkout-ref-path",
+	"git.clean-force",
+	"git.reset-hard",
+	"git.reset-merge",
+	"git.restore-unstaged",
+	"git.restore-worktree",
+	"git.stash-clear",
+	"git.stash-drop",
+	"git.switch-discard-changes",
+	"git.switch-force",
+]);
 
-/** The destruction a denied rule causes, or undefined for a rule that destroys nothing. */
+const RECURSIVE_DELETE_RULES = new Set([
+	"rm.git-metadata",
+	"rm.recursive-force-cwd-self",
+	"rm.recursive-force-dynamic-target",
+	"rm.recursive-force-home-cwd",
+	"rm.recursive-force-outside-cwd",
+	"rm.recursive-force-paranoid",
+	"rm.recursive-force-root-or-home",
+	"find.delete",
+	"find.delete-git-metadata",
+	"find.exec-rm-recursive-force",
+	"xargs.rm-recursive-force-dynamic",
+	"parallel.rm-recursive-force-dynamic",
+]);
+
+/** The delete rules whose targets another command supplies, so a note is all this package can write. */
+const UNPARSED_DELETE_RULES = new Set([
+	"find.delete",
+	"find.delete-git-metadata",
+	"find.exec-rm-recursive-force",
+	"xargs.rm-recursive-force-dynamic",
+	"parallel.rm-recursive-force-dynamic",
+]);
+
+/** The destruction a denied rule causes, or undefined for a rule that destroys no work this package copies. */
 const destructionOf = (ruleId: string): Destruction | undefined => {
-	if (ruleId.startsWith("secret.")) return undefined;
-	if (GIT_DISCARD_RULE.test(ruleId)) return "git-discard";
-	if (RECURSIVE_DELETE_RULE.test(ruleId)) return "recursive-delete";
+	if (GIT_DISCARD_RULES.has(ruleId)) return "git-discard";
+	if (RECURSIVE_DELETE_RULES.has(ruleId)) return "recursive-delete";
 	return undefined;
 };
 
 /** One thing to copy: where it is now, and where it goes in the archive. */
 type Target = { label: string; source: string; stored: string };
-
-/** The repo root and every changed and untracked file git status lists in it. */
-const gitTargets = (cwd: string): { repo: string; targets: Target[] } | undefined => {
-	const top = spawnSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8" });
-	if (top.status !== 0) return undefined;
-	const repo = top.stdout.trim();
-	const status = spawnSync("git", ["-C", repo, "status", "--porcelain=v1", "-z", "--untracked-files=all"], {
-		encoding: "utf8",
-	});
-	if (status.status !== 0) return undefined;
-	const entries = status.stdout.split("\0");
-	const targets: Target[] = [];
-	for (let index = 0; index < entries.length; index += 1) {
-		const entry = entries[index];
-		if (!entry) continue;
-		const state = entry.slice(0, 2);
-		const path = entry.slice(3);
-		if (state.includes("R") || state.includes("C")) index += 1;
-		targets.push({ label: path, source: join(repo, path), stored: join("files", path) });
-	}
-	return { repo, targets };
-};
 
 /** Split a command into words the way sh quotes them, keeping operators as their own words. */
 const tokenize = (command: string): string[] => {
@@ -138,6 +160,90 @@ const tokenize = (command: string): string[] => {
 
 /** A word sh would expand before rm sees it: a variable, a glob or command substitution. */
 const isDynamic = (word: string): boolean => /[$`*?\[\]{}]/.test(word) || (word.startsWith("~") && word !== "~" && !word.startsWith("~/"));
+
+const OPERATORS = ["&", "|", ";", ">", "<"];
+
+/**
+ * The folder a command's git runs in: the tool call's cwd, moved by each `cd <literal>` that
+ * opens a statement. Anything else before git (a wrapper such as `sudo`, a variable
+ * assignment, a folder this package cannot read) leaves the folder unknown, because copying
+ * the cwd's repository would copy a repository git will not touch.
+ */
+const folderBefore = (tokens: string[], cwd: string): { folder: string; gitAt: number } | { unknown: string } => {
+	const gitAt = tokens.findIndex((token) => token.split("/").pop() === "git");
+	if (gitAt === -1) return { unknown: "the command does not name a git whose folder could be read" };
+	let folder = cwd;
+	let statementStart = true;
+	for (let index = 0; index < gitAt; index += 1) {
+		const token = tokens[index];
+		if (OPERATORS.includes(token)) {
+			statementStart = true;
+			continue;
+		}
+		if (!statementStart || token.split("/").pop() !== "cd") {
+			return { unknown: `the command runs \`${token}\` before git, so the repository cannot be read` };
+		}
+		const target = tokens[index + 1];
+		if (target === undefined || target === "-" || isDynamic(target)) {
+			return { unknown: "the command changes folder with a path that cannot be read" };
+		}
+		folder = resolve(folder, expandTilde(target));
+		index += 1;
+		statementStart = false;
+	}
+	return { folder, gitAt };
+};
+
+/**
+ * The global options before a git subcommand (`-C <path>`, `--git-dir`, and the like), which
+ * say which folder and repository git works in. A dynamic one is reported rather than passed
+ * to git, because a path that cannot be read names no repository to copy from.
+ */
+const gitGlobalOptions = (tokens: string[], gitAt: number): { options: string[] } | { unknown: string } => {
+	const options: string[] = [];
+	for (let index = gitAt + 1; index < tokens.length; index += 1) {
+		const token = tokens[index];
+		if (!token.startsWith("-") || token === "-" || OPERATORS.includes(token)) break;
+		if (isDynamic(token)) return { unknown: `the option \`${token}\` names a folder that cannot be resolved` };
+		options.push(token);
+		if (!["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"].includes(token)) continue;
+		const value = tokens[index + 1];
+		if (value === undefined) return { unknown: `the option \`${token}\` has no value` };
+		if (isDynamic(value)) return { unknown: `the value \`${value}\` of ${token} names a folder that cannot be resolved` };
+		options.push(["-C", "--git-dir", "--work-tree", "--exec-path"].includes(token) ? expandTilde(value) : value);
+		index += 1;
+	}
+	return { options };
+};
+
+/** The repository a git command runs in, and every changed and untracked file git status lists in it. */
+const gitTargets = (command: string, cwd: string): { repo: string; targets: Target[] } | { unknown: string } => {
+	const tokens = tokenize(command);
+	const placed = folderBefore(tokens, cwd);
+	if ("unknown" in placed) return placed;
+	const parsed = gitGlobalOptions(tokens, placed.gitAt);
+	if ("unknown" in parsed) return parsed;
+	const git = [...parsed.options];
+	const top = spawnSync("git", [...git, "rev-parse", "--show-toplevel"], { cwd: placed.folder, encoding: "utf8" });
+	if (top.status !== 0) return { unknown: "the folder is not a git repository" };
+	const repo = top.stdout.trim();
+	const status = spawnSync("git", [...git, "status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+		cwd: placed.folder,
+		encoding: "utf8",
+	});
+	if (status.status !== 0) return { unknown: "git status failed" };
+	const entries = status.stdout.split("\0");
+	const targets: Target[] = [];
+	for (let index = 0; index < entries.length; index += 1) {
+		const entry = entries[index];
+		if (!entry) continue;
+		const state = entry.slice(0, 2);
+		const path = entry.slice(3);
+		if (state.includes("R") || state.includes("C")) index += 1;
+		targets.push({ label: path, source: join(repo, path), stored: join("files", path) });
+	}
+	return { repo, targets };
+};
 
 /** Every temporary root a recursive delete may destroy without an archive. */
 const temporaryRoots = (): string[] => {
@@ -204,11 +310,27 @@ const copy = (source: string, destination: string): void => {
 	if (plain.status !== 0) throw new Error((plain.stderr || cloned.stderr || "cp failed").trim());
 };
 
-/** The bytes a target holds, without following symlinks. */
-const sizeOf = (path: string): number => {
+/**
+ * The bytes a target holds, without following symlinks, stopping as soon as the running total
+ * passes the cap: a folder far over it costs one subtree, not the whole tree. A folder that
+ * cannot be listed counts for nothing and is left to the copy to report, so one unreadable
+ * corner does not turn a listed target into an unmeasured one.
+ */
+const sizeOf = (path: string, remaining: number): number => {
 	const stats = lstatSync(path);
 	if (!stats.isDirectory()) return stats.size;
-	return readdirSync(path).reduce((total, name) => total + sizeOf(join(path, name)), 0);
+	let total = 0;
+	let names: string[];
+	try {
+		names = readdirSync(path);
+	} catch {
+		return total;
+	}
+	for (const name of names) {
+		total += sizeOf(join(path, name), Math.max(remaining - total, 1));
+		if (total > remaining) return total;
+	}
+	return total;
 };
 
 /** A folder name pi-soft-delete owns: date, time, then the rule id. */
@@ -256,8 +378,10 @@ export const purgeArchives = (settings: SoftDeleteSettings, now: Date = new Date
 };
 
 const restoreLines = (destruction: Destruction, archive: string, copied: Target[], repo: string | undefined): string[] => {
+	if (copied.length === 0) return [];
 	if (destruction === "git-discard") {
-		return ["Copy the archived files back over the repository:", "", `    cp -R '${archive}/files/.' '${repo ?? "(the repository)"}/'`];
+		if (repo === undefined) return [];
+		return ["Copy the archived files back over the repository:", "", `    cp -R '${archive}/files/.' '${repo}/'`];
 	}
 	return copied.flatMap((target) => [`    cp -R '${join(archive, target.stored)}' '${target.label}'`]);
 };
@@ -284,6 +408,7 @@ const writeNote = (options: {
 		`- Folder: ${cwd}`,
 		`- Session file: ${sessionFile ?? "(unknown)"}`,
 		`- Rule: ${ruleId}`,
+		...(repo !== undefined ? [`- Repository: ${repo}`] : []),
 		`- Created: ${now.toISOString()}`,
 		"",
 	];
@@ -324,12 +449,16 @@ export const archiveCommand = (options: {
 	let targets: Target[];
 	let unknown: string | undefined;
 	if (destruction === "git-discard") {
-		const listed = gitTargets(cwd);
-		repo = listed?.repo;
-		targets = listed?.targets ?? [];
-		if (!listed) unknown = "the changed files could not be listed because the folder is not a git repository";
+		const listed = gitTargets(command, cwd);
+		if ("unknown" in listed) {
+			unknown = `the changed files could not be listed because ${listed.unknown}`;
+			targets = [];
+		} else {
+			repo = listed.repo;
+			targets = listed.targets;
+		}
 	} else {
-		if (UNPARSED_DELETE_RULE.test(verdict.ruleId)) {
+		if (UNPARSED_DELETE_RULES.has(verdict.ruleId)) {
 			unknown = "the command's targets could not be worked out: another command (a pipe, xargs or find) supplies them";
 			targets = [];
 		} else {
@@ -360,7 +489,7 @@ export const archiveCommand = (options: {
 				notCopied.push({ label: target.label, why: "not on disk" });
 				continue;
 			}
-			if (sizeOf(target.source) > settings.maxBytes) {
+			if (sizeOf(target.source, settings.maxBytes) > settings.maxBytes) {
 				notCopied.push({ label: target.label, why: `over the ${settings.maxBytes}-byte size cap` });
 				continue;
 			}
