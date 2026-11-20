@@ -453,12 +453,39 @@ test("a failed copy is named in the note and the handler still does not block", 
 	}
 });
 
+/** The tip a ref points at, asked of git directly rather than through anything the archive reads with. */
+const tipOf = (repo: string, ref: string): string =>
+	execFileSync("git", ["-C", repo, "rev-parse", ref], { encoding: "utf8" }).trim();
+
 /** A bare remote beside the scratch repo, added as its `origin`, so ref moves run for real. */
-const bareRemote = (workspace: Workspace, name = "origin"): string => {
+const bareRemote = (workspace: Workspace): string => {
 	const remote = join(workspace.dir, "remote.git");
 	execFileSync("git", ["init", "-q", "--bare", remote]);
-	execFileSync("git", ["-C", workspace.repo, "remote", "add", name, remote]);
+	execFileSync("git", ["-C", workspace.repo, "remote", "add", "origin", remote]);
 	return remote;
+};
+
+/** A scratch repo whose `main` is already on its new bare remote, answering the remote's folder. */
+const repoWithRemote = (workspace: Workspace): string => {
+	const remote = bareRemote(workspace);
+	commitFiles(workspace.repo, { "base.txt": "the base commit\n" });
+	execFileSync("git", ["-C", workspace.repo, "push", "-q", "origin", "HEAD:main"]);
+	return remote;
+};
+
+/** Give `branch` a commit only it reaches, push it to `origin`, leave it checked out, and answer its tip. */
+const branchOnRemote = (workspace: Workspace, branch: string): string => {
+	execFileSync("git", ["-C", workspace.repo, "checkout", "-q", "-b", branch]);
+	commitFiles(workspace.repo, { "dropped.txt": `the commit only ${branch} reaches\n` });
+	execFileSync("git", ["-C", workspace.repo, "push", "-q", "origin", branch]);
+	return tipOf(workspace.repo, branch);
+};
+
+/** Push `branch` with a commit only it reaches, then drop that commit locally, so a force push loses the remote's tip. */
+const branchBehindItsRemote = (workspace: Workspace, branch: string): string => {
+	const oldTip = branchOnRemote(workspace, branch);
+	execFileSync("git", ["-C", workspace.repo, "reset", "-q", "--hard", "HEAD~1"]);
+	return oldTip;
 };
 
 /** The restore commands the note gives, as the reader would run them. */
@@ -477,14 +504,8 @@ const restoreCommandOf = (archive: string): string => restoreCommandsOf(archive)
 test("a force push archives the remote's old tip in a bundle the note fetches back, without blocking", async () => {
 	const workspace = makeWorkspace();
 	try {
-		bareRemote(workspace);
-		commitFiles(workspace.repo, { "base.txt": "the base commit\n" });
-		execFileSync("git", ["-C", workspace.repo, "push", "-q", "origin", "HEAD:main"]);
-		execFileSync("git", ["-C", workspace.repo, "checkout", "-q", "-b", "feat"]);
-		commitFiles(workspace.repo, { "dropped.txt": "the commit a force push drops\n" });
-		execFileSync("git", ["-C", workspace.repo, "push", "-q", "origin", "feat"]);
-		const oldTip = execFileSync("git", ["-C", workspace.repo, "rev-parse", "feat"], { encoding: "utf8" }).trim();
-		execFileSync("git", ["-C", workspace.repo, "reset", "-q", "--hard", "HEAD~1"]);
+		repoWithRemote(workspace);
+		const oldTip = branchBehindItsRemote(workspace, "feat");
 
 		const handlers = loadSoftDelete(workspace.settings);
 		const result = await driveToolCall(handlers, workspace, "git push --force origin feat");
@@ -494,10 +515,7 @@ test("a force push archives the remote's old tip in a bundle the note fetches ba
 
 		const archive = onlyArchive(workspace);
 		execFileSync("sh", ["-c", restoreCommandOf(archive)], { cwd: workspace.repo });
-		assert.equal(
-			execFileSync("git", ["-C", workspace.repo, "rev-parse", "feat"], { encoding: "utf8" }).trim(),
-			oldTip,
-		);
+		assert.equal(tipOf(workspace.repo, "feat"), oldTip);
 	} finally {
 		clearWorkspace(workspace);
 	}
@@ -509,7 +527,7 @@ test("a force-deleted local branch is archived in a bundle the note restores", a
 		commitFiles(workspace.repo, { "base.txt": "the base commit\n" });
 		execFileSync("git", ["-C", workspace.repo, "checkout", "-q", "-b", "old"]);
 		commitFiles(workspace.repo, { "lost.txt": "the commit only this branch reaches\n" });
-		const oldTip = execFileSync("git", ["-C", workspace.repo, "rev-parse", "old"], { encoding: "utf8" }).trim();
+		const oldTip = tipOf(workspace.repo, "old");
 		execFileSync("git", ["-C", workspace.repo, "checkout", "-q", "-"]);
 
 		const handlers = loadSoftDelete(workspace.settings);
@@ -520,10 +538,7 @@ test("a force-deleted local branch is archived in a bundle the note restores", a
 
 		const archive = onlyArchive(workspace);
 		execFileSync("sh", ["-c", restoreCommandOf(archive)], { cwd: workspace.repo });
-		assert.equal(
-			execFileSync("git", ["-C", workspace.repo, "rev-parse", "old"], { encoding: "utf8" }).trim(),
-			oldTip,
-		);
+		assert.equal(tipOf(workspace.repo, "old"), oldTip);
 	} finally {
 		clearWorkspace(workspace);
 	}
@@ -532,13 +547,8 @@ test("a force-deleted local branch is archived in a bundle the note restores", a
 test("deleting a remote branch archives the remote's old tip in a bundle the note restores", async () => {
 	const workspace = makeWorkspace();
 	try {
-		bareRemote(workspace);
-		commitFiles(workspace.repo, { "base.txt": "the base commit\n" });
-		execFileSync("git", ["-C", workspace.repo, "push", "-q", "origin", "HEAD:main"]);
-		execFileSync("git", ["-C", workspace.repo, "checkout", "-q", "-b", "gone"]);
-		commitFiles(workspace.repo, { "dropped.txt": "the commit the deleted remote branch held\n" });
-		execFileSync("git", ["-C", workspace.repo, "push", "-q", "origin", "gone"]);
-		const oldTip = execFileSync("git", ["-C", workspace.repo, "rev-parse", "gone"], { encoding: "utf8" }).trim();
+		repoWithRemote(workspace);
+		const oldTip = branchOnRemote(workspace, "gone");
 		execFileSync("git", ["-C", workspace.repo, "checkout", "-q", "-"]);
 
 		const handlers = loadSoftDelete(workspace.settings);
@@ -550,10 +560,7 @@ test("deleting a remote branch archives the remote's old tip in a bundle the not
 
 		const archive = onlyArchive(workspace);
 		execFileSync("sh", ["-c", restoreCommandOf(archive)], { cwd: workspace.repo });
-		assert.equal(
-			execFileSync("git", ["-C", workspace.repo, "rev-parse", "gone"], { encoding: "utf8" }).trim(),
-			oldTip,
-		);
+		assert.equal(tipOf(workspace.repo, "gone"), oldTip);
 	} finally {
 		clearWorkspace(workspace);
 	}
@@ -564,7 +571,7 @@ test("deleting a tag archives the commit it names in a bundle the note restores"
 	try {
 		commitFiles(workspace.repo, { "base.txt": "the tagged commit\n" });
 		execFileSync("git", ["-C", workspace.repo, "tag", "v1"]);
-		const taggedTip = execFileSync("git", ["-C", workspace.repo, "rev-parse", "v1"], { encoding: "utf8" }).trim();
+		const taggedTip = tipOf(workspace.repo, "v1");
 
 		const handlers = loadSoftDelete(workspace.settings);
 		const result = await driveToolCall(handlers, workspace, "git tag -d v1");
@@ -574,10 +581,7 @@ test("deleting a tag archives the commit it names in a bundle the note restores"
 
 		const archive = onlyArchive(workspace);
 		execFileSync("sh", ["-c", restoreCommandOf(archive)], { cwd: workspace.repo });
-		assert.equal(
-			execFileSync("git", ["-C", workspace.repo, "rev-parse", "v1"], { encoding: "utf8" }).trim(),
-			taggedTip,
-		);
+		assert.equal(tipOf(workspace.repo, "v1"), taggedTip);
 	} finally {
 		clearWorkspace(workspace);
 	}
@@ -586,13 +590,8 @@ test("deleting a tag archives the commit it names in a bundle the note restores"
 test("a remote branch named with a colon in git push archives the old tip the note restores", async () => {
 	const workspace = makeWorkspace();
 	try {
-		bareRemote(workspace);
-		commitFiles(workspace.repo, { "base.txt": "the base commit\n" });
-		execFileSync("git", ["-C", workspace.repo, "push", "-q", "origin", "HEAD:main"]);
-		execFileSync("git", ["-C", workspace.repo, "checkout", "-q", "-b", "gone"]);
-		commitFiles(workspace.repo, { "dropped.txt": "the commit the deleted remote branch held\n" });
-		execFileSync("git", ["-C", workspace.repo, "push", "-q", "origin", "gone"]);
-		const oldTip = execFileSync("git", ["-C", workspace.repo, "rev-parse", "gone"], { encoding: "utf8" }).trim();
+		repoWithRemote(workspace);
+		const oldTip = branchOnRemote(workspace, "gone");
 		execFileSync("git", ["-C", workspace.repo, "checkout", "-q", "-"]);
 
 		const handlers = loadSoftDelete(workspace.settings);
@@ -604,10 +603,7 @@ test("a remote branch named with a colon in git push archives the old tip the no
 
 		const archive = onlyArchive(workspace);
 		execFileSync("sh", ["-c", restoreCommandOf(archive)], { cwd: workspace.repo });
-		assert.equal(
-			execFileSync("git", ["-C", workspace.repo, "rev-parse", "gone"], { encoding: "utf8" }).trim(),
-			oldTip,
-		);
+		assert.equal(tipOf(workspace.repo, "gone"), oldTip);
 	} finally {
 		clearWorkspace(workspace);
 	}
@@ -617,16 +613,14 @@ test("a mirror push archives the remote refs it removes in one bundle the note r
 	const workspace = makeWorkspace();
 	const other = join(workspace.dir, "other");
 	try {
-		const remote = bareRemote(workspace);
-		commitFiles(workspace.repo, { "base.txt": "the base commit\n" });
-		execFileSync("git", ["-C", workspace.repo, "push", "-q", "origin", "HEAD:main"]);
+		const remote = repoWithRemote(workspace);
 		execFileSync("git", ["clone", "-q", remote, other]);
 		execFileSync("git", ["-C", other, "config", "user.name", "Soft Delete Test"]);
 		execFileSync("git", ["-C", other, "config", "user.email", "test@example.invalid"]);
 		execFileSync("git", ["-C", other, "checkout", "-q", "-b", "remote-only"]);
 		commitFiles(other, { "only.txt": "the commit only the remote branch reaches\n" });
 		execFileSync("git", ["-C", other, "push", "-q", "origin", "remote-only"]);
-		const oldTip = execFileSync("git", ["-C", other, "rev-parse", "remote-only"], { encoding: "utf8" }).trim();
+		const oldTip = tipOf(other, "remote-only");
 
 		const handlers = loadSoftDelete(workspace.settings);
 		const result = await driveToolCall(handlers, workspace, "git push --mirror origin");
@@ -638,10 +632,7 @@ test("a mirror push archives the remote refs it removes in one bundle the note r
 		const restore = restoreCommandsOf(archive).find((line) => line.includes("remote-only"));
 		assert.ok(restore, `the note names the removed remote branch:\n${noteOf(archive)}`);
 		execFileSync("sh", ["-c", restore], { cwd: workspace.repo });
-		assert.equal(
-			execFileSync("git", ["-C", workspace.repo, "rev-parse", "remote-only"], { encoding: "utf8" }).trim(),
-			oldTip,
-		);
+		assert.equal(tipOf(workspace.repo, "remote-only"), oldTip);
 	} finally {
 		clearWorkspace(workspace);
 	}
@@ -650,20 +641,16 @@ test("a mirror push archives the remote refs it removes in one bundle the note r
 test("a bundle over the size cap is named in the note but not written", async () => {
 	const workspace = makeWorkspace({ maxBytes: 1 });
 	try {
-		bareRemote(workspace);
-		commitFiles(workspace.repo, { "base.txt": "the base commit\n" });
-		execFileSync("git", ["-C", workspace.repo, "push", "-q", "origin", "HEAD:main"]);
-		execFileSync("git", ["-C", workspace.repo, "checkout", "-q", "-b", "feat"]);
-		commitFiles(workspace.repo, { "dropped.txt": "a commit no other ref holds\n" });
-		execFileSync("git", ["-C", workspace.repo, "push", "-q", "origin", "feat"]);
+		repoWithRemote(workspace);
+		branchBehindItsRemote(workspace, "feat");
 
 		const handlers = loadSoftDelete(workspace.settings);
 		const result = await driveToolCall(handlers, workspace, "git push --force origin feat");
 
-		assert.equal(result, undefined);
+		assert.equal(result, undefined, "the handler must not block the command");
 		const archive = onlyArchive(workspace);
-		const bundles = existsSync(join(archive, "bundles")) ? readdirSync(join(archive, "bundles")) : [];
-		assert.deepEqual(bundles.filter((name) => name.endsWith(".bundle")), []);
+		const files = readdirSync(archive, { recursive: true, encoding: "utf8" });
+		assert.deepEqual(files.filter((name) => name.endsWith(".bundle")), []);
 		const note = noteOf(archive);
 		assert.ok(note.includes("origin/feat"), note);
 		assert.match(note, /size cap/i);
@@ -693,14 +680,8 @@ test("a remote that cannot be fetched is named in the note and the handler does 
 test("a force push written with a plus refspec archives the remote's old tip", async () => {
 	const workspace = makeWorkspace();
 	try {
-		bareRemote(workspace);
-		commitFiles(workspace.repo, { "base.txt": "the base commit\n" });
-		execFileSync("git", ["-C", workspace.repo, "push", "-q", "origin", "HEAD:main"]);
-		execFileSync("git", ["-C", workspace.repo, "checkout", "-q", "-b", "feat"]);
-		commitFiles(workspace.repo, { "dropped.txt": "the commit a force push drops\n" });
-		execFileSync("git", ["-C", workspace.repo, "push", "-q", "origin", "feat"]);
-		const oldTip = execFileSync("git", ["-C", workspace.repo, "rev-parse", "feat"], { encoding: "utf8" }).trim();
-		execFileSync("git", ["-C", workspace.repo, "reset", "-q", "--hard", "HEAD~1"]);
+		repoWithRemote(workspace);
+		const oldTip = branchBehindItsRemote(workspace, "feat");
 
 		const handlers = loadSoftDelete(workspace.settings);
 		const result = await driveToolCall(handlers, workspace, "git push origin +feat");
@@ -710,26 +691,17 @@ test("a force push written with a plus refspec archives the remote's old tip", a
 
 		const archive = onlyArchive(workspace);
 		execFileSync("sh", ["-c", restoreCommandOf(archive)], { cwd: workspace.repo });
-		assert.equal(
-			execFileSync("git", ["-C", workspace.repo, "rev-parse", "feat"], { encoding: "utf8" }).trim(),
-			oldTip,
-		);
+		assert.equal(tipOf(workspace.repo, "feat"), oldTip);
 	} finally {
 		clearWorkspace(workspace);
 	}
 });
 
-test("a force push run with git -C archives the repository it names", async () => {
+test("a force push that also names a lease, run with git -C, archives the old tip the note restores", async () => {
 	const workspace = makeWorkspace();
 	try {
-		bareRemote(workspace);
-		commitFiles(workspace.repo, { "base.txt": "the base commit\n" });
-		execFileSync("git", ["-C", workspace.repo, "push", "-q", "origin", "HEAD:main"]);
-		execFileSync("git", ["-C", workspace.repo, "checkout", "-q", "-b", "feat"]);
-		commitFiles(workspace.repo, { "dropped.txt": "the commit a force push drops\n" });
-		execFileSync("git", ["-C", workspace.repo, "push", "-q", "origin", "feat"]);
-		const oldTip = execFileSync("git", ["-C", workspace.repo, "rev-parse", "feat"], { encoding: "utf8" }).trim();
-		execFileSync("git", ["-C", workspace.repo, "reset", "-q", "--hard", "HEAD~1"]);
+		repoWithRemote(workspace);
+		const oldTip = branchBehindItsRemote(workspace, "feat");
 
 		const handlers = loadSoftDelete(workspace.settings);
 		const result = await driveToolCall(
@@ -744,10 +716,7 @@ test("a force push run with git -C archives the repository it names", async () =
 
 		const archive = onlyArchive(workspace);
 		execFileSync("sh", ["-c", restoreCommandOf(archive)], { cwd: workspace.repo });
-		assert.equal(
-			execFileSync("git", ["-C", workspace.repo, "rev-parse", "feat"], { encoding: "utf8" }).trim(),
-			oldTip,
-		);
+		assert.equal(tipOf(workspace.repo, "feat"), oldTip);
 	} finally {
 		clearWorkspace(workspace);
 	}
